@@ -1,0 +1,14 @@
+.DS_Store
+
+# Xcode build output
+DerivedData/
+build/
+
+# Per-user Xcode state
+xcuserdata/
+*.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+
+# Swift Package Manager build output
+.build/
