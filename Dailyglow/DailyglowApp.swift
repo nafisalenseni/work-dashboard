@@ -8,6 +8,6 @@ struct DailyglowApp: App {
         }
         .defaultSize(width: 800, height: 800)
         .windowStyle(.hiddenTitleBar)
-        .windowToolbarStyle(.unifiedCompact(showsTitle: false))
+        .windowToolbarStyle(.unified(showsTitle: false))
     }
 }

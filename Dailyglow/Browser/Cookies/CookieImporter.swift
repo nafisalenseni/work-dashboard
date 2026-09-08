@@ -1,26 +1,47 @@
 import Foundation
 
 enum CookieImporter {
-    private static let defaultDomain = "github.com"
-
-    static func cookies(from input: String) throws -> [HTTPCookie] {
+    static func cookies(
+        from input: String,
+        defaultDomain: String = "github.com",
+        secureByDefault: Bool = true
+    ) throws -> [HTTPCookie] {
         let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             throw CookieImportError.emptyInput
         }
 
+        let normalizedDefaultDomain = normalizeDomain(defaultDomain)
+        guard !normalizedDefaultDomain.isEmpty else {
+            throw CookieImportError.invalidDefaultDomain(defaultDomain)
+        }
+
         if trimmed.first == "[" || trimmed.first == "{" {
-            return try cookiesFromJSON(trimmed)
+            return try cookiesFromJSON(
+                trimmed,
+                defaultDomain: normalizedDefaultDomain,
+                secureByDefault: secureByDefault
+            )
         }
 
         if BrowserCookieTableParser.looksLikeTable(trimmed) {
-            return try cookiesFromTable(trimmed)
+            return try cookiesFromTable(
+                trimmed,
+                allowedHost: normalizedDefaultDomain
+            )
         }
 
-        return try cookiesFromHeader(trimmed)
+        return try cookiesFromHeader(
+            trimmed,
+            defaultDomain: normalizedDefaultDomain,
+            secureByDefault: secureByDefault
+        )
     }
 
-    private static func cookiesFromTable(_ input: String) throws -> [HTTPCookie] {
+    private static func cookiesFromTable(
+        _ input: String,
+        allowedHost: String
+    ) throws -> [HTTPCookie] {
         let rows: [BrowserCookieTableParser.Row]
         do {
             rows = try BrowserCookieTableParser.parse(input)
@@ -40,7 +61,8 @@ enum CookieImporter {
                 sameSite: row.sameSite,
                 expirationDate: expirationDate(
                     from: ["expires": row.expiration]
-                )
+                ),
+                allowedHost: allowedHost
             )
         }
 
@@ -51,7 +73,11 @@ enum CookieImporter {
         return cookies
     }
 
-    private static func cookiesFromJSON(_ input: String) throws -> [HTTPCookie] {
+    private static func cookiesFromJSON(
+        _ input: String,
+        defaultDomain: String,
+        secureByDefault: Bool
+    ) throws -> [HTTPCookie] {
         guard let data = input.data(using: .utf8) else {
             throw CookieImportError.invalidJSON
         }
@@ -85,7 +111,7 @@ enum CookieImporter {
 
             let domain = (entry["domain"] as? String) ?? defaultDomain
             let path = (entry["path"] as? String) ?? "/"
-            let secure = (entry["secure"] as? Bool) ?? true
+            let secure = (entry["secure"] as? Bool) ?? secureByDefault
             let httpOnly = (entry["httpOnly"] as? Bool) ?? false
             let hostOnly = (entry["hostOnly"] as? Bool) ?? false
             let sameSite = entry["sameSite"] as? String
@@ -100,7 +126,8 @@ enum CookieImporter {
                 httpOnly: httpOnly,
                 hostOnly: hostOnly,
                 sameSite: sameSite,
-                expirationDate: expirationDate
+                expirationDate: expirationDate,
+                allowedHost: defaultDomain
             )
         }
 
@@ -111,7 +138,11 @@ enum CookieImporter {
         return cookies
     }
 
-    private static func cookiesFromHeader(_ input: String) throws -> [HTTPCookie] {
+    private static func cookiesFromHeader(
+        _ input: String,
+        defaultDomain: String,
+        secureByDefault: Bool
+    ) throws -> [HTTPCookie] {
         let header = input.replacingOccurrences(
             of: #"^Cookie:\s*"#,
             with: "",
@@ -133,11 +164,12 @@ enum CookieImporter {
                 ),
                 domain: defaultDomain,
                 path: "/",
-                secure: true,
+                secure: secureByDefault,
                 httpOnly: false,
                 hostOnly: true,
                 sameSite: nil,
-                expirationDate: nil
+                expirationDate: nil,
+                allowedHost: defaultDomain
             )
         }
 
@@ -157,17 +189,17 @@ enum CookieImporter {
         httpOnly: Bool,
         hostOnly: Bool,
         sameSite: String?,
-        expirationDate: Date?
+        expirationDate: Date?,
+        allowedHost: String
     ) throws -> HTTPCookie {
-        let normalizedDomain = domain
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .trimmingCharacters(in: CharacterSet(charactersIn: "."))
-            .lowercased()
+        let normalizedDomain = normalizeDomain(domain)
 
-        guard normalizedDomain == "github.com"
-                || normalizedDomain.hasSuffix(".github.com")
+        guard cookieDomain(normalizedDomain, matches: allowedHost)
         else {
-            throw CookieImportError.unsupportedDomain(domain)
+            throw CookieImportError.unsupportedDomain(
+                domain,
+                expectedHost: allowedHost
+            )
         }
 
         guard !name.isEmpty,
@@ -188,7 +220,7 @@ enum CookieImporter {
         var attributes = ["\(name)=\(value)", "Path=\(cookiePath)"]
 
         if !requiresHostOnly {
-            attributes.append("Domain=\(domain)")
+            attributes.append("Domain=\(normalizedDomain)")
         }
 
         if requiresSecure {
@@ -207,7 +239,10 @@ enum CookieImporter {
             attributes.append("Expires=\(httpDateString(from: expirationDate))")
         }
 
-        guard let originURL = URL(string: "https://\(normalizedDomain)"),
+        let originScheme = requiresSecure ? "https" : "http"
+        guard let originURL = URL(
+            string: "\(originScheme)://\(normalizedDomain)"
+        ),
               let cookie = HTTPCookie.cookies(
                 withResponseHeaderFields: [
                     "Set-Cookie": attributes.joined(separator: "; ")
@@ -219,6 +254,20 @@ enum CookieImporter {
         }
 
         return cookie
+    }
+
+    private static func normalizeDomain(_ domain: String) -> String {
+        domain
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+            .lowercased()
+    }
+
+    private static func cookieDomain(
+        _ cookieDomain: String,
+        matches host: String
+    ) -> Bool {
+        cookieDomain == host || host.hasSuffix(".\(cookieDomain)")
     }
 
     private static func expirationDate(from entry: [String: Any]) -> Date? {
@@ -287,19 +336,22 @@ enum CookieImporter {
 
 private enum CookieImportError: LocalizedError {
     case emptyInput
+    case invalidDefaultDomain(String)
     case invalidJSON
     case unsupportedJSON
     case missingFields(index: Int)
     case invalidTableLine(Int)
     case invalidHeader
     case noCookies
-    case unsupportedDomain(String)
+    case unsupportedDomain(String, expectedHost: String)
     case invalidCookie(String)
 
     var errorDescription: String? {
         switch self {
         case .emptyInput:
             return "Paste at least one cookie."
+        case .invalidDefaultDomain(let domain):
+            return "The default cookie domain \(domain) is not valid."
         case .invalidJSON:
             return "The pasted JSON is not valid."
         case .unsupportedJSON:
@@ -312,8 +364,8 @@ private enum CookieImportError: LocalizedError {
             return "Expected a Cookie header containing name=value pairs separated by semicolons."
         case .noCookies:
             return "No cookies were found."
-        case .unsupportedDomain(let domain):
-            return "The cookie domain \(domain) is not a GitHub domain."
+        case .unsupportedDomain(let domain, let expectedHost):
+            return "The cookie domain \(domain) does not match \(expectedHost)."
         case .invalidCookie(let name):
             return "The cookie named \(name.isEmpty ? "(empty)" : name) could not be imported."
         }

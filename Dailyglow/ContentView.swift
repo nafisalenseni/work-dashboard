@@ -1,58 +1,71 @@
 import SwiftUI
 
 struct ContentView: View {
-    @StateObject private var githubConnection: GitHubConnection
-    @State private var selectedPullRequestID: GitHubPullRequest.ID?
-    @State private var githubNavigationRequest: GitHubNavigationRequest?
-
-    private let connectsOnAppear: Bool
-    private let startsBrowserAtHome: Bool
+    @StateObject private var githubConnection = GitHubConnection()
+    @State private var columnVisibility: NavigationSplitViewVisibility = .all
+    @State private var browserSession = BrowserSession()
 
     init(
-        githubConnection: GitHubConnection = GitHubConnection(),
-        connectsOnAppear: Bool = true,
-        startsBrowserAtHome: Bool = true
     ) {
-        _githubConnection = StateObject(wrappedValue: githubConnection)
-        self.connectsOnAppear = connectsOnAppear
-        self.startsBrowserAtHome = startsBrowserAtHome
     }
 
     var body: some View {
-        NavigationSplitView {
+        NavigationSplitView(columnVisibility: $columnVisibility) {
             SidebarView(
                 connection: githubConnection,
-                selectedPullRequestID: $selectedPullRequestID,
                 onOpenPullRequest: openPullRequest
             )
-            .task {
-                guard connectsOnAppear else { return }
-                await githubConnection.connect()
-            }
+                .toolbar(
+                    removing: columnVisibility == .detailOnly
+                        ? .sidebarToggle
+                        : nil
+                )
         } detail: {
-            GitHubWebView(
-                navigationRequest: githubNavigationRequest,
-                startsAtHome: startsBrowserAtHome
-            )
+            MainView(browserSession: browserSession)
+                .ignoresSafeArea(.container, edges: .top)
         }
-        .navigationSplitViewStyle(.balanced)
-        .toolbar(removing: .title)
-        .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
-        .ignoresSafeArea(.container, edges: .top)
+        .containerBackground(.ultraThinMaterial, for: .window)
+        .toolbar {
+            if columnVisibility == .detailOnly {
+                sidebarToggleItem
+            }
+        }
+        .task {
+            await githubConnection.refreshPeriodically()
+        }
     }
 
-    private func openPullRequest(_ pullRequest: GitHubPullRequest) {
-        githubNavigationRequest = GitHubNavigationRequest(url: pullRequest.url)
+    @ToolbarContentBuilder
+    private var sidebarToggleItem: some ToolbarContent {
+        ToolbarItem(placement: .navigation) {
+            ControlButton(
+                title: sidebarButtonTitle,
+                systemImage: "sidebar.left",
+                action: toggleSidebar
+            )
+        }
+        .sharedBackgroundVisibility(.hidden)
+    }
+
+    private var sidebarButtonTitle: String {
+        columnVisibility == .detailOnly ? "Show Sidebar" : "Hide Sidebar"
+    }
+
+    private func toggleSidebar() {
+        withAnimation {
+            columnVisibility = columnVisibility == .detailOnly
+                ? .all
+                : .detailOnly
+        }
+    }
+
+    private func openPullRequest(_ pullRequest: PullRequest) {
+        browserSession.open(pullRequest.url)
     }
 }
 
 #if DEBUG
 #Preview("Dailyglow") {
-    ContentView(
-        githubConnection: GitHubConnection.preview(),
-        connectsOnAppear: false,
-        startsBrowserAtHome: false
-    )
-    .frame(width: 1_000, height: 720)
+    ContentView()
 }
 #endif

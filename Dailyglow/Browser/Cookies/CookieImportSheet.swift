@@ -6,14 +6,26 @@ struct CookieImportSheet: View {
     @State private var cookieText = ""
     @State private var errorMessage: String?
 
+    let defaultDomain: String
+    let secureByDefault: Bool
     let onImport: ([HTTPCookie]) -> Void
+
+    init(
+        defaultDomain: String = "github.com",
+        secureByDefault: Bool = true,
+        onImport: @escaping ([HTTPCookie]) -> Void
+    ) {
+        self.defaultDomain = defaultDomain
+        self.secureByDefault = secureByDefault
+        self.onImport = onImport
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("Import GitHub Cookies")
+            Text("Import Cookies")
                 .font(.title2.weight(.semibold))
 
-            Text("Paste exported cookie JSON, rows copied from a browser cookie table, or a Cookie header containing name=value pairs. Cookies with expiration dates persist until they expire; session cookies last until Dailyglow quits.")
+            Text("Paste exported cookie JSON, rows copied from a browser cookie table, or a Cookie header containing name=value pairs. Cookies without a domain use \(defaultDomain). Cookies with expiration dates persist until they expire; session cookies last until Dailyglow quits.")
                 .foregroundStyle(.secondary)
 
             TextEditor(text: $cookieText)
@@ -58,7 +70,11 @@ struct CookieImportSheet: View {
 
     private func importCookies() {
         do {
-            let cookies = try CookieImporter.cookies(from: cookieText)
+            let cookies = try CookieImporter.cookies(
+                from: cookieText,
+                defaultDomain: defaultDomain,
+                secureByDefault: secureByDefault
+            )
             onImport(cookies)
             dismiss()
         } catch {
