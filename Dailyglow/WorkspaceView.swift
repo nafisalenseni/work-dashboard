@@ -2,14 +2,31 @@ import SwiftUI
 import WebKit
 import Network
 
+struct WorkspaceLink: Equatable {
+    let id = UUID()
+    let path: String
+
+    init?(url: URL) {
+        guard ["https", "http", "dailyglow"].contains(url.scheme?.lowercased() ?? ""),
+              url.host?.lowercased() == "github.com" else { return nil }
+        let parts = url.path.split(separator: "/")
+        guard parts.count >= 4, parts[2] == "pull", let number = Int(parts[3]), number > 0,
+              parts[0].range(of: "^[A-Za-z0-9_-]+$", options: .regularExpression) != nil,
+              parts[1].range(of: "^[A-Za-z0-9_.-]+$", options: .regularExpression) != nil else { return nil }
+        path = "/\(parts[0])/\(parts[1])/pull/\(number)"
+    }
+}
+
 struct WorkspaceView: View {
+    var incomingLink: WorkspaceLink? = nil
     var body: some View {
-        PullDashWebView()
+        PullDashWebView(incomingLink: incomingLink)
             .panelStyle()
     }
 }
 
 private struct PullDashWebView: NSViewRepresentable {
+    var incomingLink: WorkspaceLink?
     func makeCoordinator() -> Coordinator { Coordinator() }
     func makeNSView(context: Context) -> WKWebView {
         let configuration = WKWebViewConfiguration()
@@ -17,10 +34,15 @@ private struct PullDashWebView: NSViewRepresentable {
         let view = WKWebView(frame: .zero, configuration: configuration)
         view.navigationDelegate = context.coordinator
         view.uiDelegate = context.coordinator
+        context.coordinator.pendingLink = incomingLink
         context.coordinator.start(view)
         return view
     }
-    func updateNSView(_ view: WKWebView, context: Context) {}
+    func updateNSView(_ view: WKWebView, context: Context) {
+        guard let incomingLink, incomingLink.id != context.coordinator.handledLinkID else { return }
+        context.coordinator.pendingLink = incomingLink
+        context.coordinator.openPendingLink(view)
+    }
     static func dismantleNSView(_ view: WKWebView, coordinator: Coordinator) {
         view.configuration.userContentController.removeScriptMessageHandler(forName: "dailyglowGitHub", contentWorld: .page)
         coordinator.server?.stop()
@@ -29,6 +51,15 @@ private struct PullDashWebView: NSViewRepresentable {
     @MainActor final class Coordinator: NSObject, WKScriptMessageHandlerWithReply, WKNavigationDelegate, WKUIDelegate {
         var server: WorkspaceAssetServer?
         var origin: URL?
+        var pendingLink: WorkspaceLink?
+        var handledLinkID: UUID?
+        func openPendingLink(_ view: WKWebView) {
+            guard let origin, let link = pendingLink,
+                  let url = URL(string: link.path, relativeTo: origin) else { return }
+            handledLinkID = link.id
+            pendingLink = nil
+            view.load(URLRequest(url: url))
+        }
         func start(_ view: WKWebView) {
             guard let root = Bundle.main.url(forResource: "PullDashWeb", withExtension: nil) else {
                 view.loadHTMLString("<p>Workspace assets are missing. Run npm run bundle from pulldash-workspace, then rebuild Dailyglow.</p>", baseURL: nil)
@@ -40,7 +71,10 @@ private struct PullDashWebView: NSViewRepresentable {
                     Task { @MainActor in
                         let url = URL(string: "http://127.0.0.1:\(port)/")!
                         self?.origin = url
-                        view?.load(URLRequest(url: url))
+                        if let self, let view {
+                            if self.pendingLink != nil { self.openPendingLink(view) }
+                            else { view.load(URLRequest(url: url)) }
+                        }
                     }
                 }
             } catch {

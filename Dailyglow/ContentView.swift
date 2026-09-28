@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct ContentView: View {
+    var incomingLink: WorkspaceLink? = nil
     @State private var sidebarWidth: CGFloat = 280
     @State private var resizeStartWidth: CGFloat?
 
@@ -37,7 +38,7 @@ struct ContentView: View {
                                 }
                             }
                     }
-                WorkspaceView()
+                WorkspaceView(incomingLink: incomingLink)
                     .frame(minWidth: 400, maxWidth: .infinity)
             }
         }
