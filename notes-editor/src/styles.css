@@ -1,0 +1,82 @@
+body {
+  margin: 0;
+  background: transparent;
+}
+
+/* Keep BlockNote's own spacing, including room for block handles. */
+#root {
+  padding: 24px 16px;
+}
+
+.bn-container {
+  --bn-font-family: Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+}
+
+.bn-container .bn-editor {
+  font-family: var(--bn-font-family);
+  background: transparent;
+}
+
+.bn-container .bn-block-content {
+  padding: 0;
+  align-items: center;
+}
+
+.bn-container .bn-block-content[data-content-type="checkListItem"] > div:has(> input) {
+  display: flex;
+  height: 24px;
+  align-items: center;
+}
+
+.bn-container .bn-block-content[data-content-type="checkListItem"] > .bn-inline-content {
+  margin: 0;
+  line-height: 24px;
+}
+
+.bn-container .bn-editor [data-content-type="checkListItem"] input[type="checkbox"] {
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  align-self: center;
+  /* Reset browser-specific input spacing and any inherited positioning. */
+  margin: 0 8px 0 4px;
+  box-sizing: border-box;
+  position: static;
+  top: auto;
+  border: 1px solid #767676;
+  border-radius: 50%;
+  background: Field;
+  display: grid;
+  place-content: center;
+}
+
+.bn-container .bn-editor [data-content-type="checkListItem"] input[type="checkbox"]:checked {
+  background: AccentColor;
+  border-color: AccentColor;
+}
+
+.bn-container .bn-editor [data-content-type="checkListItem"] input[type="checkbox"]:checked::after {
+  content: "";
+  width: 7px;
+  height: 4px;
+  border-left: 2px solid AccentColorText;
+  border-bottom: 2px solid AccentColorText;
+  transform: translateY(-1px) rotate(-45deg);
+}
+
+#loading, #error {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: #777;
+  font: 13px -apple-system, BlinkMacSystemFont, sans-serif;
+  background: transparent;
+}
+
+#error {
+  display: none;
+  padding: 24px;
+  text-align: center;
+}

@@ -1,0 +1,11 @@
+{
+  "name": "dailyglow-pulldash-workspace",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "cd upstream && PATH=\"../.tools/node_modules/.bin:$PATH\" bun run dev",
+    "build": "cd upstream && PATH=\"../.tools/node_modules/.bin:$PATH\" bun run build:browser",
+    "typecheck": "cd upstream && PATH=\"../.tools/node_modules/.bin:$PATH\" bun run typecheck",
+    "bundle": "node bundle.mjs"
+  }
+}

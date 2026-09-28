@@ -10,7 +10,12 @@
 		A10000000000000000000001 /* DailyglowApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000001 /* DailyglowApp.swift */; };
 		A10000000000000000000002 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000002 /* ContentView.swift */; };
 		A10000000000000000000003 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000003 /* Assets.xcassets */; };
-		A10000000000000000000009 /* BrowserTab.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000B /* BrowserTab.swift */; };
+		A10000000000000000000007 /* InboxPanelView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000007 /* InboxPanelView.swift */; };
+		A10000000000000000000008 /* WorkspaceView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000008 /* WorkspaceView.swift */; };
+		A10000000000000000000011 /* PanelStyle.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000011 /* PanelStyle.swift */; };
+		A10000000000000000000012 /* BlockNoteEditorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000012 /* BlockNoteEditorView.swift */; };
+		A10000000000000000000016 /* NotesEditorWeb in Resources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000016 /* NotesEditorWeb */; };
+		B10000000000000000000017 /* PullDashWeb in Resources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000017 /* PullDashWeb */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -19,13 +24,16 @@
 		A20000000000000000000003 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		A20000000000000000000004 /* Dailyglow.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Dailyglow.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A20000000000000000000006 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
-		A2000000000000000000000B /* BrowserTab.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrowserTab.swift; sourceTree = "<group>"; };
+		A20000000000000000000007 /* InboxPanelView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InboxPanelView.swift; sourceTree = "<group>"; };
+		A20000000000000000000008 /* WorkspaceView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceView.swift; sourceTree = "<group>"; };
+		A20000000000000000000011 /* PanelStyle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PanelStyle.swift; sourceTree = "<group>"; };
+		A20000000000000000000012 /* BlockNoteEditorView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BlockNoteEditorView.swift; sourceTree = "<group>"; };
+		A20000000000000000000016 /* NotesEditorWeb */ = {isa = PBXFileReference; lastKnownFileType = folder; path = NotesEditorWeb; sourceTree = "<group>"; };
+		B20000000000000000000017 /* PullDashWeb */ = {isa = PBXFileReference; lastKnownFileType = folder; path = PullDashWeb; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
-		D01188A73047C83E006C523E /* Browser */ = {isa = PBXFileSystemSynchronizedRootGroup; explicitFileTypes = {}; explicitFolders = (); path = Browser; sourceTree = "<group>"; };
-		D01188C83047D0F0006C523E /* Sidebar */ = {isa = PBXFileSystemSynchronizedRootGroup; explicitFileTypes = {}; explicitFolders = (); path = Sidebar; sourceTree = "<group>"; };
-		D01188C93047D11F006C523E /* Github */ = {isa = PBXFileSystemSynchronizedRootGroup; explicitFileTypes = {}; explicitFolders = (); path = Github; sourceTree = "<group>"; };
+		C01188C83047D0F0006C523E /* Inbox */ = {isa = PBXFileSystemSynchronizedRootGroup; explicitFileTypes = {}; explicitFolders = (); path = Inbox; sourceTree = "<group>"; };
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -50,12 +58,15 @@
 		A40000000000000000000002 /* Dailyglow */ = {
 			isa = PBXGroup;
 			children = (
-				D01188C93047D11F006C523E /* Github */,
-				D01188C83047D0F0006C523E /* Sidebar */,
-				D01188A73047C83E006C523E /* Browser */,
 				A20000000000000000000001 /* DailyglowApp.swift */,
 				A20000000000000000000002 /* ContentView.swift */,
-				A2000000000000000000000B /* BrowserTab.swift */,
+				C01188C83047D0F0006C523E /* Inbox */,
+				A20000000000000000000007 /* InboxPanelView.swift */,
+				A20000000000000000000008 /* WorkspaceView.swift */,
+				A20000000000000000000011 /* PanelStyle.swift */,
+				A20000000000000000000012 /* BlockNoteEditorView.swift */,
+				A20000000000000000000016 /* NotesEditorWeb */,
+				B20000000000000000000017 /* PullDashWeb */,
 				A20000000000000000000006 /* Info.plist */,
 				A20000000000000000000003 /* Assets.xcassets */,
 			);
@@ -86,9 +97,7 @@
 			dependencies = (
 			);
 			fileSystemSynchronizedGroups = (
-				D01188A73047C83E006C523E /* Browser */,
-				D01188C83047D0F0006C523E /* Sidebar */,
-				D01188C93047D11F006C523E /* Github */,
+				C01188C83047D0F0006C523E /* Inbox */,
 			);
 			name = Dailyglow;
 			packageProductDependencies = (
@@ -137,6 +146,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				A10000000000000000000003 /* Assets.xcassets in Resources */,
+				A10000000000000000000016 /* NotesEditorWeb in Resources */,
+				B10000000000000000000017 /* PullDashWeb in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -149,7 +160,10 @@
 			files = (
 				A10000000000000000000001 /* DailyglowApp.swift in Sources */,
 				A10000000000000000000002 /* ContentView.swift in Sources */,
-				A10000000000000000000009 /* BrowserTab.swift in Sources */,
+				A10000000000000000000007 /* InboxPanelView.swift in Sources */,
+				A10000000000000000000008 /* WorkspaceView.swift in Sources */,
+				A10000000000000000000011 /* PanelStyle.swift in Sources */,
+				A10000000000000000000012 /* BlockNoteEditorView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -260,10 +274,13 @@
 		A80000000000000000000003 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = AWDACYM6KQ;
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
@@ -289,10 +306,13 @@
 		A80000000000000000000004 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = AWDACYM6KQ;
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;

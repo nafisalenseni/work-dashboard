@@ -12,3 +12,27 @@ xcuserdata/
 
 # Swift Package Manager build output
 .build/
+
+# JavaScript dependencies
+node_modules/
+
+# Local credentials and environment files (keep sanitized templates)
+.env
+.env.*
+!.env.example
+!.env.*.example
+!.env.sample
+*.pem
+*.key
+*.p12
+*.pfx
+*.mobileprovision
+
+# Local tooling output
+*.log
+.prettiercache
+*.tsbuildinfo
+coverage/
+.vercel/
+supabase/.temp/
+supabase/.branches/

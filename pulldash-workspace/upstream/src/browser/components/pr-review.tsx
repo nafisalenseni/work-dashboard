@@ -1,0 +1,3922 @@
+import type { PullRequest, PullRequestFile, ReviewComment } from "@/api/types";
+import { useVirtualizer } from "@tanstack/react-virtual";
+import {
+  Check,
+  CheckCircle2,
+  ChevronDown,
+  ChevronRight,
+  ChevronsUpDown,
+  ChevronUp,
+  Circle,
+  ExternalLink,
+  Eye,
+  PanelLeftClose,
+  FileCode,
+  Loader2,
+  MessageSquare,
+  Pencil,
+  Reply,
+  Search,
+  Send,
+  Smile,
+  Trash2,
+  X,
+  XCircle,
+} from "lucide-react";
+import React, {
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { useParams } from "react-router-dom";
+import { cn } from "../cn";
+import { useAuth, useCanWrite } from "../contexts/auth";
+import type { Reaction, ReactionContent } from "../contexts/github";
+import {
+  useCurrentUser,
+  useGitHubReady,
+  useGitHubStore,
+  usePRChecks,
+} from "../contexts/github";
+import {
+  getTimeAgo,
+  PRReviewProvider,
+  useCommentActions,
+  useCommentCountsByFile,
+  useCommentingRange,
+  useCommentRangeLookup,
+  useCurrentDiff,
+  useCurrentFile,
+  useCurrentFileComments,
+  useCurrentFilePendingComments,
+  useCurrentUserLoader,
+  useDiffLoader,
+  useFileCopyActions,
+  useHashNavigation,
+  useIsCurrentFileLoading,
+  useKeyboardNavigation,
+  usePendingCommentCountsByFile,
+  usePendingReviewLoader,
+  usePRReviewSelector,
+  usePRReviewStore,
+  useReviewActions,
+  useSkipBlockExpansion,
+  useThreadActions,
+  type DiffLine,
+  type DiffSkipBlock,
+  type DiffViewMode,
+  type LocalPendingComment,
+  type ParsedDiff,
+} from "../contexts/pr-review";
+import { useTabContext, type TabStatus } from "../contexts/tabs";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "../ui/dropdown-menu";
+import { Keycap, KeycapGroup } from "../ui/keycap";
+import { Markdown, MarkdownEditor } from "../ui/markdown";
+import { RadioGroup, RadioGroupItem } from "../ui/radio-group";
+import { Skeleton } from "../ui/skeleton";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "../ui/tooltip";
+import { CommandPalette, useCommandPalette } from "./command-palette";
+import { FileHeader } from "./file-header";
+import { FileTree } from "./file-tree";
+import { PRHeader } from "./pr-header";
+import { PRNavigation, PROverview, type TabType } from "./pr-overview";
+
+// ============================================================================
+// Hook to sync PR check status with tab
+// ============================================================================
+
+function useSyncTabStatus(
+  tabId: string | undefined,
+  owner: string,
+  repo: string,
+  number: number,
+  prData: {
+    merged: boolean;
+    draft?: boolean;
+    state: string;
+    mergeable: boolean | null;
+  } | null
+) {
+  const { status: checkStatus } = usePRChecks(owner, repo, number);
+
+  // Get tab context for status updates
+  let updateTabStatus: ((tabId: string, status: TabStatus) => void) | undefined;
+  try {
+    const tabContext = useTabContext();
+    updateTabStatus = tabContext.updateTabStatus;
+  } catch {
+    // Not in tab context, ignore
+  }
+
+  // Sync to tab whenever status changes
+  useEffect(() => {
+    if (!tabId || !updateTabStatus || !prData) return;
+
+    const state: TabStatus["state"] = prData.merged
+      ? "merged"
+      : prData.draft
+        ? "draft"
+        : prData.state === "open"
+          ? "open"
+          : "closed";
+
+    updateTabStatus(tabId, {
+      checks: checkStatus?.checks || "pending",
+      state,
+      mergeable: prData.mergeable,
+    });
+  }, [tabId, updateTabStatus, prData, checkStatus]);
+}
+
+// ============================================================================
+// Page Component (Data Fetching) - Used for direct URL access
+// ============================================================================
+
+export function PRReviewPage() {
+  const { owner, repo, number } = useParams<{
+    owner: string;
+    repo: string;
+    number: string;
+  }>();
+
+  if (!owner || !repo || !number) {
+    return (
+      <div className="flex items-center justify-center h-screen">
+        <p className="text-destructive">Invalid PR URL</p>
+      </div>
+    );
+  }
+
+  return (
+    <PRReviewContent owner={owner} repo={repo} number={parseInt(number, 10)} />
+  );
+}
+
+// ============================================================================
+// Content Component (Used by tabs and direct URL)
+// ============================================================================
+
+interface PRReviewContentProps {
+  owner: string;
+  repo: string;
+  number: number;
+  tabId?: string;
+}
+
+export function PRReviewContent({
+  owner,
+  repo,
+  number,
+  tabId,
+}: PRReviewContentProps) {
+  const { ready: githubReady, error: githubError } = useGitHubReady();
+  const github = useGitHubStore();
+  const [pr, setPr] = useState<PullRequest | null>(null);
+  const [files, setFiles] = useState<PullRequestFile[]>([]);
+  const [comments, setComments] = useState<ReviewComment[]>([]);
+  const [viewerPermission, setViewerPermission] = useState<string | null>(null);
+  const [viewerCanMergeAsAdmin, setViewerCanMergeAsAdmin] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  // Sync check status with tab (uses data store for auto-refresh)
+  useSyncTabStatus(tabId, owner, repo, number, pr);
+
+  useEffect(() => {
+    if (!githubReady) return;
+
+    let cancelled = false;
+    const fetchData = async () => {
+      // Returning to a retained tab refreshes without replacing its DOM.
+      setLoading(!pr);
+      setError(null);
+      try {
+        const [prData, filesData] = await Promise.all([
+          github.getPR(owner, repo, number),
+          github.getPRFiles(owner, repo, number),
+        ]);
+        if (cancelled) return;
+        setPr(prData);
+        setFiles(filesData);
+        setLoading(false);
+        // Comments and permissions enrich the mounted view independently.
+        void github
+          .getPRComments(owner, repo, number)
+          .then((data) => {
+            if (!cancelled) setComments(data as ReviewComment[]);
+          })
+          .catch(() => {});
+        void github
+          .getReviewThreads(owner, repo, number)
+          .then((data) => {
+            if (cancelled) return;
+            setViewerPermission(data.viewerPermission);
+            setViewerCanMergeAsAdmin(data.viewerCanMergeAsAdmin);
+          })
+          .catch(() => {});
+      } catch (e) {
+        if (!cancelled && !pr)
+          setError(e instanceof Error ? e.message : "Unknown error");
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
+    void fetchData();
+    return () => {
+      cancelled = true;
+    };
+  }, [github, owner, repo, number, githubReady]);
+
+  // Show loading while GitHub client initializes
+  if (!githubReady) {
+    if (githubError) {
+      return (
+        <div className="flex items-center justify-center h-full">
+          <div className="flex flex-col items-center gap-4">
+            <p className="text-destructive font-medium">
+              Failed to connect to GitHub
+            </p>
+            <p className="text-sm text-muted-foreground">{githubError}</p>
+          </div>
+        </div>
+      );
+    }
+    return <PRReviewSkeleton />;
+  }
+
+  if (loading) {
+    return <PRReviewSkeleton />;
+  }
+
+  if (error || !pr) {
+    return (
+      <div className="flex items-center justify-center h-full">
+        <div className="flex flex-col items-center gap-4 max-w-md text-center">
+          <p className="text-destructive font-medium">Failed to load PR</p>
+          <p className="text-sm text-muted-foreground">{error}</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <PRReviewProvider
+      github={github}
+      pr={pr}
+      files={files}
+      comments={comments}
+      owner={owner}
+      repo={repo}
+      viewerPermission={viewerPermission}
+    >
+      <PRReviewLayout />
+    </PRReviewProvider>
+  );
+}
+
+// ============================================================================
+// Main Review Component (Layout)
+// ============================================================================
+
+function PRReviewLayout() {
+  const store = usePRReviewStore();
+  const { open: commandPaletteOpen, setOpen: setCommandPaletteOpen } =
+    useCommandPalette();
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
+  const [desktopSidebarOpen, setDesktopSidebarOpen] = useState(true);
+
+  // Expose for button click
+  const openCommandPalette = useCallback(
+    () => setCommandPaletteOpen(true),
+    [setCommandPaletteOpen]
+  );
+
+  // Close mobile sidebar when a file is selected
+  const handleMobileFileSelect = useCallback(() => {
+    setMobileSidebarOpen(false);
+  }, []);
+
+  // Initialize hooks that load data
+  useKeyboardNavigation();
+  useHashNavigation();
+  useDiffLoader();
+  usePendingReviewLoader();
+  useCurrentUserLoader();
+
+  // Listen for delete comment events from keyboard navigation
+  const { deleteComment, removePendingComment } = useCommentActions();
+  useEffect(() => {
+    const handler = (e: CustomEvent<{ commentId: number }>) => {
+      deleteComment(e.detail.commentId);
+    };
+    window.addEventListener(
+      "pr-review:delete-comment",
+      handler as EventListener
+    );
+    return () =>
+      window.removeEventListener(
+        "pr-review:delete-comment",
+        handler as EventListener
+      );
+  }, [deleteComment]);
+
+  // Listen for delete pending comment events from keyboard navigation
+  useEffect(() => {
+    const handler = (e: CustomEvent<{ commentId: string }>) => {
+      removePendingComment(e.detail.commentId);
+    };
+    window.addEventListener(
+      "pr-review:delete-pending-comment",
+      handler as EventListener
+    );
+    return () =>
+      window.removeEventListener(
+        "pr-review:delete-pending-comment",
+        handler as EventListener
+      );
+  }, [removePendingComment]);
+
+  // Clear comment/line focus when clicking outside
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      const target = e.target as HTMLElement;
+
+      // Check if click is inside interactive elements that should NOT clear focus
+      const isInteractive =
+        target.closest("[data-comment-thread]") ||
+        target.closest("[data-line-gutter]") ||
+        target.closest("[data-line-num]") || // Any click on a diff line (content or gutter)
+        target.closest("button") ||
+        target.closest("a") ||
+        target.closest("textarea") ||
+        target.closest("input") ||
+        target.closest("[cmdk-root]");
+
+      const state = store.getSnapshot();
+
+      // Clear comment focus if clicking outside comments
+      if (!isInteractive && state.focusedCommentId) {
+        store.setFocusedCommentId(null);
+      }
+
+      // Clear line focus if clicking anywhere except diff lines and interactive elements
+      if (!isInteractive && (state.focusedLine || state.selectionAnchor)) {
+        store.clearLineSelection();
+      }
+    };
+
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, [store]);
+
+  const pr = usePRReviewSelector((s) => s.pr);
+  const owner = usePRReviewSelector((s) => s.owner);
+  const repo = usePRReviewSelector((s) => s.repo);
+  const selectedFile = usePRReviewSelector((s) => s.selectedFile);
+
+  const canWrite = useCanWrite();
+
+  return (
+    <div className="flex flex-col h-full">
+      <PRHeader
+        pr={pr}
+        owner={owner}
+        repo={repo}
+        onToggleSidebar={() => setMobileSidebarOpen(!mobileSidebarOpen)}
+        onToggleDesktopSidebar={() => setDesktopSidebarOpen((open) => !open)}
+        desktopSidebarOpen={desktopSidebarOpen}
+        rightContent={canWrite ? <SubmitReviewDropdown /> : undefined}
+      />
+
+      <div className="flex flex-1 overflow-hidden min-h-0">
+        {/* Mobile sidebar overlay */}
+        {mobileSidebarOpen && (
+          <div
+            className="fixed inset-0 bg-black/50 z-40 md:hidden"
+            onClick={() => setMobileSidebarOpen(false)}
+          />
+        )}
+        <FilePanel
+          onOpenSearch={openCommandPalette}
+          desktopOpen={desktopSidebarOpen}
+          onDesktopCollapse={() => setDesktopSidebarOpen(false)}
+          mobileOpen={mobileSidebarOpen}
+          onMobileClose={() => setMobileSidebarOpen(false)}
+          onFileSelect={handleMobileFileSelect}
+        />
+        <DiffPanel />
+      </div>
+
+      <CommandPalette
+        open={commandPaletteOpen}
+        onOpenChange={setCommandPaletteOpen}
+      />
+    </div>
+  );
+}
+
+// ============================================================================
+// File Panel (Sidebar)
+// ============================================================================
+
+interface FilePanelProps {
+  onOpenSearch: () => void;
+  mobileOpen?: boolean;
+  desktopOpen?: boolean;
+  onDesktopCollapse?: () => void;
+  onMobileClose?: () => void;
+  onFileSelect?: () => void;
+}
+
+const FilePanel = memo(function FilePanel({
+  onOpenSearch,
+  mobileOpen,
+  desktopOpen = true,
+  onDesktopCollapse,
+  onMobileClose,
+  onFileSelect,
+}: FilePanelProps) {
+  const store = usePRReviewStore();
+  const files = usePRReviewSelector((s) => s.files);
+  const selectedFile = usePRReviewSelector((s) => s.selectedFile);
+  const selectedFiles = usePRReviewSelector((s) => s.selectedFiles);
+  const viewedFiles = usePRReviewSelector((s) => s.viewedFiles);
+
+  const commentCounts = useCommentCountsByFile();
+  const pendingCommentCounts = usePendingCommentCountsByFile();
+  const { copyDiff, copyFile, copyMainVersion } = useFileCopyActions();
+
+  // Wrap file selection to close mobile sidebar
+  const handleSelectFile = useCallback(
+    (filename: string) => {
+      store.selectFile(filename);
+      onFileSelect?.();
+    },
+    [store, onFileSelect]
+  );
+
+  return (
+    <aside
+      id="pr-file-list"
+      className={cn(
+        "w-64 border-r border-border flex flex-col overflow-hidden shrink-0 bg-background",
+        // Mobile: absolute positioned drawer
+        "fixed inset-y-0 left-0 z-50 transition-transform duration-200 ease-in-out md:relative md:translate-x-0",
+        mobileOpen ? "translate-x-0" : "-translate-x-full",
+        !desktopOpen && "md:hidden"
+      )}
+    >
+      {/* Mobile close button */}
+      <div className="flex items-center justify-between px-2 py-2 border-b border-border md:hidden">
+        <span className="text-sm font-medium">Files</span>
+        <button
+          onClick={onMobileClose}
+          className="p-1 rounded hover:bg-muted transition-colors"
+        >
+          <X className="w-4 h-4" />
+        </button>
+      </div>
+
+      {/* Search button with file-list collapse */}
+      <div className="mx-2 my-2 flex items-center gap-1.5">
+        <button
+          onClick={onOpenSearch}
+          className="flex-1 flex items-center gap-1.5 px-2 py-1.5 text-xs text-muted-foreground bg-muted/50 hover:bg-muted rounded-md border border-border transition-colors"
+        >
+          <Search className="w-3.5 h-3.5" />
+          <span className="flex-1 text-left">Search...</span>
+          <KeycapGroup keys={["cmd", "k"]} size="xs" />
+        </button>
+        <TooltipProvider delayDuration={300}>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                onClick={onDesktopCollapse}
+                aria-label="Collapse file list"
+                aria-expanded={true}
+                aria-controls="pr-file-list"
+                className="hidden md:inline-flex p-1.5 rounded-md border border-border transition-colors text-muted-foreground bg-muted/50 hover:bg-muted"
+              >
+                <PanelLeftClose className="w-3.5 h-3.5" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent>Collapse file list</TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
+      </div>
+
+      <div className="border-t border-border/50" />
+
+      <FileTree
+        files={files}
+        selectedFile={selectedFile}
+        selectedFiles={selectedFiles}
+        viewedFiles={viewedFiles}
+        hideViewed={false}
+        commentCounts={commentCounts}
+        pendingCommentCounts={pendingCommentCounts}
+        onSelectFile={handleSelectFile}
+        onToggleFileSelection={store.toggleFileSelection}
+        onToggleViewed={store.toggleViewed}
+        onToggleViewedMultiple={store.toggleViewedMultiple}
+        onMarkFolderViewed={store.markFolderViewed}
+        onCopyDiff={copyDiff}
+        onCopyFile={copyFile}
+        onCopyMainVersion={copyMainVersion}
+      />
+    </aside>
+  );
+});
+
+// ============================================================================
+// Read-Only Banner
+// ============================================================================
+
+const ReadOnlyBanner = memo(function ReadOnlyBanner() {
+  const canWrite = useCanWrite();
+  const { reconnect } = useAuth();
+
+  if (canWrite) return null;
+
+  return (
+    <div className="shrink-0 bg-amber-500/10 border-b border-amber-500/20 px-4 py-2 flex items-center justify-between">
+      <div className="flex items-center gap-2 text-sm">
+        <Eye className="w-4 h-4 text-amber-500" />
+        <span className="text-amber-700 dark:text-amber-200">
+          <span className="font-medium">Read-only mode</span>
+          <span className="text-amber-700 dark:text-amber-200/70 ml-1.5">
+            – Connect GitHub CLI to comment and submit reviews
+          </span>
+        </span>
+      </div>
+      <button
+        onClick={reconnect}
+        className="flex items-center gap-1.5 px-3 py-1 text-xs font-medium rounded-md bg-amber-500/20 text-amber-700 dark:text-amber-200 hover:bg-amber-500/30 transition-colors"
+      >
+        Retry connection
+      </button>
+    </div>
+  );
+});
+
+// ============================================================================
+// Diff Panel (Main Content)
+// ============================================================================
+
+const DiffPanel = memo(function DiffPanel() {
+  const store = usePRReviewStore();
+  const canWrite = useCanWrite();
+  const pr = usePRReviewSelector((s) => s.pr);
+  const files = usePRReviewSelector((s) => s.files);
+  const selectedFile = usePRReviewSelector((s) => s.selectedFile);
+  const viewedFiles = usePRReviewSelector((s) => s.viewedFiles);
+  const selectedFiles = usePRReviewSelector((s) => s.selectedFiles);
+  const showOverview = usePRReviewSelector((s) => s.showOverview);
+  const diffViewMode = usePRReviewSelector((s) => s.diffViewMode);
+
+  const currentFile = useCurrentFile();
+  const parsedDiff = useCurrentDiff();
+  const isLoading = useIsCurrentFileLoading();
+
+  const currentIndex = selectedFile
+    ? files.findIndex((f) => f.filename === selectedFile)
+    : -1;
+
+  const [overviewTab, setOverviewTab] = useState<TabType>("conversation");
+  const navigation = (
+    <PRNavigation
+      activeTab={showOverview ? overviewTab : "files"}
+      onSelect={(tab) => {
+        if (tab === "files") {
+          const filename = selectedFile || files[0]?.filename;
+          if (filename) store.selectFile(filename);
+        } else {
+          setOverviewTab(tab);
+          store.selectOverview();
+        }
+      }}
+    />
+  );
+
+  // Show overview panel
+  if (showOverview) {
+    return (
+      <main className="flex-1 overflow-hidden flex flex-col">
+        <ReadOnlyBanner />
+        {navigation}
+        <PROverview activeTab={overviewTab} />
+      </main>
+    );
+  }
+
+  return (
+    <main className="flex-1 overflow-hidden flex flex-col">
+      <ReadOnlyBanner />
+      {navigation}
+
+      {currentFile ? (
+        <div className="flex flex-col flex-1 min-h-0">
+          {/* Sticky file header with navigation */}
+          <div className="shrink-0 border-b border-border bg-muted/50 backdrop-blur-sm z-20">
+            <div className="px-3 py-1.5">
+              <FileHeader
+                file={currentFile}
+                isViewed={viewedFiles.has(currentFile.filename)}
+                onToggleViewed={() => store.toggleViewed(currentFile.filename)}
+                currentIndex={currentIndex}
+                totalFiles={files.length}
+                onPrevFile={() => store.navigateToPrevUnviewedFile()}
+                onNextFile={() => store.navigateToNextUnviewedFile()}
+                diffViewMode={diffViewMode}
+                onToggleDiffViewMode={() => store.toggleDiffViewMode()}
+              />
+            </div>
+          </div>
+
+          {/* Scrollable diff content - DiffViewer handles its own virtualized scroll */}
+          <div className="flex-1 min-h-0 flex flex-col">
+            {parsedDiff && parsedDiff.hunks.length > 0 ? (
+              <DiffViewer diff={parsedDiff} viewMode={diffViewMode} />
+            ) : isLoading || (currentFile.patch && !parsedDiff) ? (
+              // Show skeleton if loading OR if file has patch but diff isn't ready yet
+              <DiffSkeleton />
+            ) : (
+              <div className="p-4 text-sm text-muted-foreground text-center flex-1 flex items-center justify-center">
+                {!currentFile.patch
+                  ? "Binary file or file too large to display"
+                  : "No changes to display"}
+              </div>
+            )}
+          </div>
+
+          <KeybindsBar />
+        </div>
+      ) : (
+        <div className="flex flex-col flex-1 min-h-0">
+          <div className="flex items-center justify-center flex-1 text-muted-foreground">
+            Select a file to view changes
+          </div>
+          <KeybindsBar />
+        </div>
+      )}
+    </main>
+  );
+});
+
+// ============================================================================
+// Keybinds Bar
+// ============================================================================
+
+const KeybindsBar = memo(function KeybindsBar() {
+  const gotoLineMode = usePRReviewSelector((s) => s.gotoLineMode);
+  const gotoLineInput = usePRReviewSelector((s) => s.gotoLineInput);
+  const gotoLineSide = usePRReviewSelector((s) => s.gotoLineSide);
+  const focusedLine = usePRReviewSelector((s) => s.focusedLine);
+  const selectionAnchor = usePRReviewSelector((s) => s.selectionAnchor);
+  const focusedCommentId = usePRReviewSelector((s) => s.focusedCommentId);
+  const focusedPendingCommentId = usePRReviewSelector(
+    (s) => s.focusedPendingCommentId
+  );
+  const focusedSkipBlockIndex = usePRReviewSelector(
+    (s) => s.focusedSkipBlockIndex
+  );
+  const commentingOnLine = usePRReviewSelector((s) => s.commentingOnLine);
+  const pendingCommentsCount = usePRReviewSelector(
+    (s) => s.pendingComments.length
+  );
+
+  const showEscape =
+    gotoLineMode ||
+    focusedLine ||
+    focusedCommentId ||
+    focusedPendingCommentId ||
+    focusedSkipBlockIndex !== null ||
+    commentingOnLine;
+
+  return (
+    <div
+      className={cn(
+        "shrink-0 border-t border-border px-3 py-2 min-h-[36px]",
+        gotoLineMode && "bg-blue-500/10",
+        (focusedCommentId || focusedPendingCommentId) && "bg-yellow-500/10",
+        commentingOnLine && "bg-green-500/10",
+        focusedSkipBlockIndex !== null && "bg-blue-500/10",
+        !gotoLineMode &&
+          !focusedCommentId &&
+          !focusedPendingCommentId &&
+          !commentingOnLine &&
+          focusedSkipBlockIndex === null &&
+          "bg-card/50"
+      )}
+    >
+      <div className="flex items-center justify-between text-xs">
+        <div className="flex items-center gap-4">
+          {gotoLineMode ? (
+            <>
+              <span className="flex items-center gap-2">
+                <span className="px-2 py-0.5 bg-blue-500/20 text-blue-700 dark:text-blue-400 rounded text-xs font-medium">
+                  GOTO
+                </span>
+                <span
+                  className={cn(
+                    "px-1.5 py-0.5 rounded text-xs font-medium",
+                    gotoLineSide === "new"
+                      ? "bg-green-500/20 text-green-700 dark:text-green-400"
+                      : "bg-orange-500/20 text-orange-700 dark:text-orange-400"
+                  )}
+                >
+                  {gotoLineSide === "new" ? "new" : "old"}
+                </span>
+                <span className="font-mono text-blue-700 dark:text-blue-400">
+                  {gotoLineInput || "..."}
+                </span>
+              </span>
+              <span className="flex items-center gap-1.5 text-muted-foreground">
+                <Keycap keyName="Tab" size="xs" /> toggle side
+              </span>
+              <span className="flex items-center gap-1.5 text-muted-foreground">
+                <Keycap keyName="Enter" size="xs" /> jump
+              </span>
+            </>
+          ) : commentingOnLine ? (
+            <>
+              <span className="px-2 py-0.5 bg-green-500/20 text-green-700 dark:text-green-400 rounded text-xs font-medium">
+                COMMENT
+              </span>
+              <span className="font-mono text-green-700 dark:text-green-400">
+                L
+                {commentingOnLine.startLine
+                  ? `${commentingOnLine.startLine}-`
+                  : ""}
+                {commentingOnLine.line}
+              </span>
+              <span className="flex items-center gap-1.5 text-muted-foreground">
+                <KeycapGroup keys={["cmd", "Enter"]} size="xs" /> submit
+              </span>
+            </>
+          ) : focusedPendingCommentId ? (
+            <>
+              <span className="px-2 py-0.5 bg-yellow-500/20 text-yellow-700 dark:text-yellow-400 rounded text-xs font-medium">
+                PENDING
+              </span>
+              <span className="flex items-center gap-1.5 text-muted-foreground">
+                <Keycap keyName="e" size="xs" /> edit
+              </span>
+              <span className="flex items-center gap-1.5 text-muted-foreground">
+                <Keycap keyName="d" size="xs" /> delete
+              </span>
+              <span className="flex items-center gap-1.5 text-muted-foreground">
+                <Keycap keyName="up" size="xs" /> back to line
+              </span>
+            </>
+          ) : focusedCommentId ? (
+            <>
+              <span className="px-2 py-0.5 bg-yellow-500/20 text-yellow-700 dark:text-yellow-400 rounded text-xs font-medium">
+                COMMENT
+              </span>
+              <span className="flex items-center gap-1.5 text-muted-foreground">
+                <Keycap keyName="r" size="xs" /> reply
+              </span>
+              <span className="flex items-center gap-1.5 text-muted-foreground">
+                <Keycap keyName="e" size="xs" /> edit
+              </span>
+              <span className="flex items-center gap-1.5 text-muted-foreground">
+                <Keycap keyName="d" size="xs" /> delete
+              </span>
+              <span className="flex items-center gap-1.5 text-muted-foreground">
+                <Keycap keyName="up" size="xs" /> back to line
+              </span>
+            </>
+          ) : focusedSkipBlockIndex !== null ? (
+            <>
+              <span className="px-2 py-0.5 bg-blue-500/20 text-blue-700 dark:text-blue-400 rounded text-xs font-medium">
+                EXPAND
+              </span>
+              <span className="flex items-center gap-1.5 text-muted-foreground">
+                <Keycap keyName="Enter" size="xs" /> expand hidden lines
+              </span>
+              <span className="flex items-center gap-1.5 text-muted-foreground">
+                <KeycapGroup keys={["up", "down"]} size="xs" /> navigate
+              </span>
+            </>
+          ) : focusedLine ? (
+            <>
+              <span className="font-mono text-blue-700 dark:text-blue-400">
+                {selectionAnchor
+                  ? `L${Math.min(focusedLine, selectionAnchor)}-${Math.max(focusedLine, selectionAnchor)}`
+                  : `L${focusedLine}`}
+              </span>
+              <span className="flex items-center gap-1.5 text-muted-foreground">
+                <Keycap keyName="c" size="xs" /> comment
+              </span>
+              <span className="flex items-center gap-1.5 text-muted-foreground">
+                <Keycap keyName="down" size="xs" /> view comments
+              </span>
+              <span className="flex items-center gap-1.5 text-muted-foreground">
+                <Keycap keyName="Shift" size="xs" />
+                <KeycapGroup keys={["up", "down"]} size="xs" /> select range
+              </span>
+              <span className="flex items-center gap-1.5 text-muted-foreground">
+                <KeycapGroup keys={["cmd", "up", "down"]} size="xs" /> jump 10
+              </span>
+            </>
+          ) : (
+            <>
+              <span className="flex items-center gap-1.5 text-muted-foreground">
+                <KeycapGroup keys={["cmd", "k"]} size="xs" /> search files
+              </span>
+              <span className="flex items-center gap-1.5 text-muted-foreground">
+                <KeycapGroup keys={["up", "down"]} size="xs" /> select line
+              </span>
+              <span className="flex items-center gap-1.5 text-muted-foreground">
+                <KeycapGroup keys={["cmd", "up", "down"]} size="xs" /> jump 10
+              </span>
+              <span className="flex items-center gap-1.5 text-muted-foreground">
+                <Keycap keyName="g" size="xs" /> goto line
+              </span>
+              <span className="flex items-center gap-1.5 text-muted-foreground">
+                <Keycap keyName="j" size="xs" />
+                <Keycap keyName="k" size="xs" /> prev/next file
+              </span>
+              <span className="flex items-center gap-1.5 text-muted-foreground">
+                <Keycap keyName="v" size="xs" /> mark viewed
+              </span>
+            </>
+          )}
+        </div>
+        <div className="flex items-center gap-3">
+          {pendingCommentsCount > 0 && (
+            <span className="text-yellow-700 dark:text-yellow-400 text-xs">
+              {pendingCommentsCount} pending comment
+              {pendingCommentsCount !== 1 ? "s" : ""}
+            </span>
+          )}
+          {showEscape && (
+            <span className="flex items-center gap-1.5 text-muted-foreground">
+              <Keycap keyName="Esc" size="xs" />
+              {gotoLineMode ? "cancel" : commentingOnLine ? "cancel" : "clear"}
+            </span>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+});
+
+// ============================================================================
+// Line Number Drag Selection Context
+// ============================================================================
+
+interface LineDragContextValue {
+  isDragging: boolean;
+  dragAnchor: number | null;
+  onDragStart: (
+    lineNum: number,
+    side: "old" | "new",
+    shiftKey?: boolean
+  ) => void;
+  onDragEnter: (lineNum: number, side: "old" | "new") => void;
+  onDragEnd: () => void;
+  onClickFallback: (lineNum: number, side: "old" | "new") => void;
+  commentingRange: { start: number; end: number } | null;
+  commentRangeLookup: Set<number> | null;
+}
+
+const LineDragContext = React.createContext<LineDragContextValue | null>(null);
+
+function useLineDrag() {
+  const ctx = React.useContext(LineDragContext);
+  if (!ctx) throw new Error("useLineDrag must be used within LineDragProvider");
+  return ctx;
+}
+
+// ============================================================================
+// Virtual Row Types for Flattened Diff
+// ============================================================================
+
+// Split line pair for side-by-side view
+interface SplitLinePair {
+  left: DiffLine | null; // Old (deletion/context)
+  right: DiffLine | null; // New (insertion/context)
+  lineNum: number | undefined; // Primary line number for comments
+}
+
+type VirtualRowType =
+  | {
+      type: "skip";
+      hunk: DiffSkipBlock;
+      skipIndex: number;
+      startLine: number;
+      index: number;
+    }
+  | { type: "line"; line: DiffLine; lineNum: number | undefined; index: number }
+  | { type: "split-line"; pair: SplitLinePair; index: number }
+  | { type: "comment-form"; lineNum: number; startLine?: number; index: number }
+  | { type: "pending-comment"; comment: LocalPendingComment; index: number }
+  | {
+      type: "comment-thread";
+      comments: ReviewComment[];
+      lineNum: number;
+      index: number;
+    }
+  | { type: "skip-spacer"; position: "before" | "after"; index: number };
+
+// ============================================================================
+// Diff Viewer (Virtualized)
+// ============================================================================
+
+interface DiffViewerProps {
+  diff: ParsedDiff;
+  viewMode: DiffViewMode;
+}
+
+const DiffViewer = memo(function DiffViewer({
+  diff,
+  viewMode,
+}: DiffViewerProps) {
+  const hunks = diff?.hunks ?? [];
+  const store = usePRReviewStore();
+  const parentRef = useRef<HTMLDivElement>(null);
+
+  // Get all comments and pending comments for building virtual rows
+  const comments = useCurrentFileComments();
+  const pendingComments = useCurrentFilePendingComments();
+  const commentingOnLine = usePRReviewSelector((s) => s.commentingOnLine);
+  const selectedFile = usePRReviewSelector((s) => s.selectedFile);
+
+  // Note: selectionState removed from context - rows subscribe directly to avoid re-renders
+  const commentingRange = useCommentingRange();
+  const commentRangeLookup = useCommentRangeLookup();
+
+  // Subscribe to expanded skip blocks directly for re-render triggering
+  const expandedSkipBlocks = usePRReviewSelector((s) => s.expandedSkipBlocks);
+
+  // Skip block expansion
+  const { expandSkipBlock, isExpanding } = useSkipBlockExpansion();
+
+  // Selectors lifted to parent level - only subscriptions here instead of per-row
+  const focusedSkipBlockIndex = usePRReviewSelector(
+    (s) => s.focusedSkipBlockIndex
+  );
+  const focusedCommentId = usePRReviewSelector((s) => s.focusedCommentId);
+  const focusedPendingCommentId = usePRReviewSelector(
+    (s) => s.focusedPendingCommentId
+  );
+  const editingCommentId = usePRReviewSelector((s) => s.editingCommentId);
+  const editingPendingCommentId = usePRReviewSelector(
+    (s) => s.editingPendingCommentId
+  );
+  const replyingToCommentId = usePRReviewSelector((s) => s.replyingToCommentId);
+
+  // Helper to get expanded lines for a skip block
+  const getExpandedLines = useCallback(
+    (skipIndex: number): DiffLine[] | null => {
+      if (!selectedFile) return null;
+      const key = `${selectedFile}:${skipIndex}`;
+      return expandedSkipBlocks[key] ?? null;
+    },
+    [selectedFile, expandedSkipBlocks]
+  );
+
+  // Use refs for drag state to avoid stale closure issues in handlers
+  const isDraggingRef = useRef(false);
+  const dragAnchorRef = useRef<number | null>(null);
+  const dragSideRef = useRef<"old" | "new" | null>(null);
+  const handledByMouseEventsRef = useRef(false);
+  const [isDraggingState, setIsDraggingState] = useState(false);
+
+  // Pre-compute comment lookup maps for O(1) access
+  const commentsByLine = useMemo(() => {
+    const map = new Map<number, ReviewComment[]>();
+    for (const comment of comments) {
+      const line = comment.line ?? comment.original_line;
+      if (line) {
+        const existing = map.get(line) || [];
+        existing.push(comment);
+        map.set(line, existing);
+      }
+    }
+    return map;
+  }, [comments]);
+
+  const pendingCommentsByLine = useMemo(() => {
+    const map = new Map<number, LocalPendingComment[]>();
+    for (const comment of pendingComments) {
+      const existing = map.get(comment.line) || [];
+      existing.push(comment);
+      map.set(comment.line, existing);
+    }
+    return map;
+  }, [pendingComments]);
+
+  // Group comments into threads (pre-computed)
+  const threadsByLine = useMemo(() => {
+    const result = new Map<number, ReviewComment[][]>();
+
+    for (const [lineNum, lineComments] of commentsByLine) {
+      const threadMap = new Map<number, ReviewComment[]>();
+
+      for (const comment of lineComments) {
+        if (!comment.in_reply_to_id) {
+          threadMap.set(comment.id, [comment]);
+        }
+      }
+
+      for (const comment of lineComments) {
+        if (comment.in_reply_to_id) {
+          const thread = threadMap.get(comment.in_reply_to_id);
+          if (thread) {
+            thread.push(comment);
+          }
+        }
+      }
+
+      result.set(lineNum, [...threadMap.values()]);
+    }
+
+    return result;
+  }, [commentsByLine]);
+
+  // Pre-compute skip block start lines by looking at adjacent hunks
+  const skipBlockStartLines = useMemo(() => {
+    const startLines: number[] = [];
+    let expectedNextLine = 1;
+
+    for (let i = 0; i < hunks.length; i++) {
+      const hunk = hunks[i];
+      if (hunk.type === "skip") {
+        // Skip block starts at expectedNextLine
+        startLines.push(expectedNextLine);
+        expectedNextLine += hunk.count;
+      } else {
+        // Hunk - update expected next line based on where this hunk ends
+        // The hunk contains lines, find the max newLineNumber
+        let maxNewLine = hunk.newStart;
+        for (const line of hunk.lines) {
+          if (line.newLineNumber && line.newLineNumber > maxNewLine) {
+            maxNewLine = line.newLineNumber;
+          }
+        }
+        expectedNextLine = maxNewLine + 1;
+      }
+    }
+    return startLines;
+  }, [hunks]);
+
+  // Helper to convert lines to split pairs for side-by-side view
+  const convertToSplitPairs = useCallback(
+    (lines: DiffLine[]): SplitLinePair[] => {
+      const pairs: SplitLinePair[] = [];
+      let i = 0;
+
+      while (i < lines.length) {
+        const line = lines[i];
+
+        if (line.type === "normal") {
+          // Context line - show on both sides
+          pairs.push({
+            left: line,
+            right: line,
+            lineNum: line.newLineNumber || line.oldLineNumber,
+          });
+          i++;
+        } else if (line.type === "delete") {
+          // Collect consecutive deletes
+          const deletes: DiffLine[] = [];
+          while (i < lines.length && lines[i].type === "delete") {
+            deletes.push(lines[i]);
+            i++;
+          }
+
+          // Collect consecutive inserts that follow
+          const inserts: DiffLine[] = [];
+          while (i < lines.length && lines[i].type === "insert") {
+            inserts.push(lines[i]);
+            i++;
+          }
+
+          // Pair them up
+          const maxLen = Math.max(deletes.length, inserts.length);
+          for (let j = 0; j < maxLen; j++) {
+            const del = deletes[j] || null;
+            const ins = inserts[j] || null;
+            pairs.push({
+              left: del,
+              right: ins,
+              lineNum: ins?.newLineNumber || del?.oldLineNumber,
+            });
+          }
+        } else if (line.type === "insert") {
+          // Standalone insert (no preceding delete)
+          pairs.push({
+            left: null,
+            right: line,
+            lineNum: line.newLineNumber,
+          });
+          i++;
+        }
+      }
+
+      return pairs;
+    },
+    []
+  );
+
+  // Fix 5: Separate static rows (diff structure + comments) from dynamic overlays (comment form)
+  // Static rows only change when diff or comments change
+  const staticRows = useMemo((): VirtualRowType[] => {
+    const rows: VirtualRowType[] = [];
+    let index = 0;
+    let skipIndex = 0;
+
+    // Helper to add comments after a line
+    const addCommentsForLine = (lineNum: number | undefined) => {
+      if (!lineNum) return;
+
+      const linePending = pendingCommentsByLine.get(lineNum);
+      if (linePending) {
+        for (const pending of linePending) {
+          rows.push({
+            type: "pending-comment",
+            comment: pending,
+            index: index++,
+          });
+        }
+      }
+
+      const threads = threadsByLine.get(lineNum);
+      if (threads) {
+        for (const thread of threads) {
+          rows.push({
+            type: "comment-thread",
+            comments: thread,
+            lineNum,
+            index: index++,
+          });
+        }
+      }
+    };
+
+    for (const hunk of hunks) {
+      if (hunk.type === "skip") {
+        const currentSkipIndex = skipIndex++;
+        const startLine = skipBlockStartLines[currentSkipIndex] ?? 1;
+        const expandedLines = getExpandedLines(currentSkipIndex);
+
+        if (expandedLines && expandedLines.length > 0) {
+          // Show expanded lines
+          if (viewMode === "split") {
+            const pairs = convertToSplitPairs(expandedLines);
+            for (const pair of pairs) {
+              rows.push({ type: "split-line", pair, index: index++ });
+              addCommentsForLine(pair.lineNum);
+            }
+          } else {
+            for (const line of expandedLines) {
+              const lineNum = line.newLineNumber || line.oldLineNumber;
+              rows.push({ type: "line", line, lineNum, index: index++ });
+              addCommentsForLine(lineNum);
+            }
+          }
+        } else {
+          // Show collapsed skip block with spacers
+          rows.push({
+            type: "skip-spacer",
+            position: "before",
+            index: index++,
+          });
+          rows.push({
+            type: "skip",
+            hunk,
+            skipIndex: currentSkipIndex,
+            startLine,
+            index: index++,
+          });
+          rows.push({ type: "skip-spacer", position: "after", index: index++ });
+        }
+      } else {
+        if (viewMode === "split") {
+          // Convert to split pairs
+          const pairs = convertToSplitPairs(hunk.lines);
+          for (const pair of pairs) {
+            rows.push({ type: "split-line", pair, index: index++ });
+            addCommentsForLine(pair.lineNum);
+          }
+        } else {
+          // Unified view - sequential lines
+          for (const line of hunk.lines) {
+            const lineNum = line.newLineNumber || line.oldLineNumber;
+            rows.push({ type: "line", line, lineNum, index: index++ });
+            addCommentsForLine(lineNum);
+          }
+        }
+      }
+    }
+
+    return rows;
+  }, [
+    hunks,
+    skipBlockStartLines,
+    pendingCommentsByLine,
+    threadsByLine,
+    getExpandedLines,
+    viewMode,
+    convertToSplitPairs,
+  ]);
+
+  // Dynamic: Insert comment form into the correct position (only changes when commentingOnLine changes)
+  const virtualRows = useMemo((): VirtualRowType[] => {
+    if (!commentingOnLine) return staticRows;
+
+    // Find where to insert the comment form
+    const targetLine = commentingOnLine.line;
+    const insertIndex = staticRows.findIndex((row) => {
+      if (row.type === "line" && row.lineNum === targetLine) {
+        return true;
+      }
+      if (row.type === "split-line" && row.pair.lineNum === targetLine) {
+        return true;
+      }
+      return false;
+    });
+
+    if (insertIndex === -1) return staticRows;
+
+    // Create new array with comment form inserted
+    const result: VirtualRowType[] = [];
+    let newIndex = 0;
+
+    for (let i = 0; i < staticRows.length; i++) {
+      const row = staticRows[i];
+      result.push({ ...row, index: newIndex++ });
+
+      // Insert comment form after the target line
+      if (i === insertIndex) {
+        result.push({
+          type: "comment-form",
+          lineNum: targetLine,
+          startLine: commentingOnLine.startLine,
+          index: newIndex++,
+        });
+      }
+    }
+
+    return result;
+  }, [staticRows, commentingOnLine]);
+
+  // Create O(1) lookup map for line numbers -> row indices
+  // For split view, we need to map both old and new line numbers
+  const lineNumToRowIndex = useMemo(() => {
+    const map = new Map<string, number>(); // key: "lineNum:side"
+    virtualRows.forEach((row, index) => {
+      if (row.type === "line" && row.lineNum) {
+        // Unified view: map by lineNum and side
+        const side = row.line.type === "delete" ? "old" : "new";
+        map.set(`${row.lineNum}:${side}`, index);
+        // Also add without side for simpler lookups
+        map.set(`${row.lineNum}:any`, index);
+      } else if (row.type === "split-line") {
+        // Split view: map both old and new line numbers
+        const { left, right } = row.pair;
+        if (left?.oldLineNumber) {
+          map.set(`${left.oldLineNumber}:old`, index);
+          map.set(`${left.oldLineNumber}:any`, index);
+        }
+        if (right?.newLineNumber) {
+          map.set(`${right.newLineNumber}:new`, index);
+          map.set(`${right.newLineNumber}:any`, index);
+        }
+      }
+    });
+    return map;
+  }, [virtualRows]);
+
+  // Helper to get row index by line number and optional side
+  const getRowIndexForLine = useCallback(
+    (lineNum: number, side?: "old" | "new" | null) => {
+      if (side) {
+        const exact = lineNumToRowIndex.get(`${lineNum}:${side}`);
+        if (exact !== undefined) return exact;
+      }
+      return lineNumToRowIndex.get(`${lineNum}:any`);
+    },
+    [lineNumToRowIndex]
+  );
+
+  // Estimate row heights for the virtualizer
+  const estimateSize = useCallback(
+    (index: number) => {
+      const row = virtualRows[index];
+      if (!row) return 20;
+
+      switch (row.type) {
+        case "skip-spacer":
+          return 8;
+        case "skip":
+          return 40;
+        case "line":
+          return 20;
+        case "split-line":
+          return 20;
+        case "comment-form":
+          return 180;
+        case "pending-comment":
+          return 100;
+        case "comment-thread":
+          return 80 + row.comments.length * 60;
+        default:
+          return 20;
+      }
+    },
+    [virtualRows]
+  );
+
+  const virtualizer = useVirtualizer({
+    count: virtualRows.length,
+    getScrollElement: () => parentRef.current,
+    estimateSize,
+    // Include selectedFile in key to force React to re-render when switching files
+    // This fixes dangerouslySetInnerHTML not updating when DOM elements are reused
+    getItemKey: (index) => `${selectedFile}-${index}`,
+    // High overscan for smooth navigation - rows pre-rendered above/below viewport
+    overscan: 100,
+    // Add padding at the end so we can scroll the last line to center
+    paddingEnd: 300,
+  });
+
+  const onDragStart = useCallback(
+    (lineNum: number, side: "old" | "new", shiftKey?: boolean) => {
+      const state = store.getSnapshot();
+
+      // Shift+click: extend selection from current focus to clicked line
+      if (
+        shiftKey &&
+        state.focusedLine !== null &&
+        state.focusedLineSide === side
+      ) {
+        // Keep the anchor at the original focused line, move focus to clicked line
+        if (state.selectionAnchor === null) {
+          // No existing anchor - use current focused line as anchor
+          store.setSelectionAnchor(state.focusedLine, side);
+        }
+        store.setFocusedLine(lineNum, side);
+        // Don't start drag mode for shift+click
+        return;
+      }
+
+      // Normal click: start new selection
+      isDraggingRef.current = true;
+      dragAnchorRef.current = lineNum;
+      dragSideRef.current = side;
+      store.setFocusedLine(lineNum, side);
+      store.setSelectionAnchor(lineNum, side);
+      setIsDraggingState(true);
+    },
+    [store]
+  );
+
+  const onDragEnter = useCallback(
+    (lineNum: number, side: "old" | "new") => {
+      if (
+        isDraggingRef.current &&
+        dragAnchorRef.current !== null &&
+        dragSideRef.current === side
+      ) {
+        // Only extend selection within the same side (old or new)
+        store.setFocusedLine(lineNum, side);
+      }
+    },
+    [store]
+  );
+
+  const onDragEnd = useCallback(() => {
+    if (isDraggingRef.current && dragAnchorRef.current !== null) {
+      handledByMouseEventsRef.current = true;
+      const state = store.getSnapshot();
+      const focusedLine = state.focusedLine;
+      const anchor = state.selectionAnchor;
+
+      if (focusedLine !== null) {
+        if (anchor !== null && anchor !== focusedLine) {
+          const startLine = Math.min(anchor, focusedLine);
+          const endLine = Math.max(anchor, focusedLine);
+          store.startCommenting(endLine, startLine);
+        } else {
+          store.startCommenting(focusedLine);
+        }
+      }
+    }
+    isDraggingRef.current = false;
+    dragAnchorRef.current = null;
+    dragSideRef.current = null;
+    setIsDraggingState(false);
+  }, [store]);
+
+  const onClickFallback = useCallback(
+    (lineNum: number, side: "old" | "new") => {
+      if (handledByMouseEventsRef.current) {
+        handledByMouseEventsRef.current = false;
+        return;
+      }
+      store.startCommenting(lineNum);
+    },
+    [store]
+  );
+
+  useEffect(() => {
+    const handleMouseUp = () => {
+      if (isDraggingRef.current) {
+        onDragEnd();
+      }
+    };
+    document.addEventListener("mouseup", handleMouseUp);
+    return () => document.removeEventListener("mouseup", handleMouseUp);
+  }, [onDragEnd]);
+
+  // Handle keyboard event to expand focused skip block
+  useEffect(() => {
+    const handleExpandSkipBlock = (e: CustomEvent<{ skipIndex: number }>) => {
+      const { skipIndex } = e.detail;
+      const startLine = skipBlockStartLines[skipIndex] ?? 1;
+      // Find the skip block to get its count
+      let count = 0;
+      let currentSkipIndex = 0;
+      for (const hunk of hunks) {
+        if (hunk.type === "skip") {
+          if (currentSkipIndex === skipIndex) {
+            count = hunk.count;
+            break;
+          }
+          currentSkipIndex++;
+        }
+      }
+      if (count > 0) {
+        expandSkipBlock(skipIndex, startLine, count);
+      }
+    };
+
+    window.addEventListener(
+      "pr-review:expand-skip-block",
+      handleExpandSkipBlock as EventListener
+    );
+    return () =>
+      window.removeEventListener(
+        "pr-review:expand-skip-block",
+        handleExpandSkipBlock as EventListener
+      );
+  }, [hunks, skipBlockStartLines, expandSkipBlock]);
+
+  // Handle mousemove during drag to extend selection even when not directly over line gutters
+  useEffect(() => {
+    if (!isDraggingState) return;
+
+    const handleMouseMove = (e: MouseEvent) => {
+      if (!isDraggingRef.current || !parentRef.current || !dragSideRef.current)
+        return;
+
+      const dragSide = dragSideRef.current;
+
+      // Find the line element under the mouse by checking all rendered line elements
+      const elements = parentRef.current.querySelectorAll("[data-line-gutter]");
+      let closestLine: number | null = null;
+      let closestDistance = Infinity;
+
+      for (const el of elements) {
+        const rect = el.getBoundingClientRect();
+        const centerY = rect.top + rect.height / 2;
+        const distance = Math.abs(e.clientY - centerY);
+
+        if (distance < closestDistance) {
+          // Get line number and side from the element or its parent
+          // In split view, the data attributes are on the side container
+          const sideContainer = el.closest("[data-line-side]");
+          if (sideContainer) {
+            const lineNum = sideContainer.getAttribute("data-line-num");
+            const side = sideContainer.getAttribute("data-line-side");
+            if (lineNum && side === dragSide) {
+              closestDistance = distance;
+              closestLine = parseInt(lineNum, 10);
+            }
+          } else {
+            // Unified view fallback
+            const row = el.closest("[data-index]");
+            if (row) {
+              const index = parseInt(
+                row.getAttribute("data-index") || "-1",
+                10
+              );
+              const virtualRow = virtualRows[index];
+              if (virtualRow?.type === "line" && virtualRow.lineNum) {
+                const rowSide =
+                  virtualRow.line.type === "delete" ? "old" : "new";
+                if (rowSide === dragSide) {
+                  closestDistance = distance;
+                  closestLine = virtualRow.lineNum;
+                }
+              }
+            }
+          }
+        }
+      }
+
+      if (closestLine !== null) {
+        store.setFocusedLine(closestLine, dragSide);
+      }
+    };
+
+    document.addEventListener("mousemove", handleMouseMove);
+    return () => document.removeEventListener("mousemove", handleMouseMove);
+  }, [isDraggingState, virtualRows, store]);
+
+  const dragValue = useMemo(
+    () => ({
+      isDragging: isDraggingState,
+      dragAnchor: dragAnchorRef.current,
+      onDragStart,
+      onDragEnter,
+      onDragEnd,
+      onClickFallback,
+      commentingRange,
+      commentRangeLookup,
+    }),
+    [
+      isDraggingState,
+      onDragStart,
+      onDragEnter,
+      onDragEnd,
+      onClickFallback,
+      commentingRange,
+      commentRangeLookup,
+    ]
+  );
+
+  // Selection state for CSS-based highlighting (no per-row subscriptions)
+  const focusedLine = usePRReviewSelector((s) => s.focusedLine);
+  const focusedLineSide = usePRReviewSelector((s) => s.focusedLineSide);
+  const selectionAnchor = usePRReviewSelector((s) => s.selectionAnchor);
+  const selectionAnchorSide = usePRReviewSelector((s) => s.selectionAnchorSide);
+
+  // Combined scroll + selection effect using RAF to prevent jitter
+  const containerRef = useRef<HTMLDivElement>(null);
+  const rafIdRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    // Cancel any pending RAF
+    if (rafIdRef.current !== null) {
+      cancelAnimationFrame(rafIdRef.current);
+    }
+
+    rafIdRef.current = requestAnimationFrame(() => {
+      rafIdRef.current = null;
+      const container = containerRef.current;
+
+      // 1. Update selection highlighting
+      if (container) {
+        // Clear previous selection
+        const prevSelected = container.querySelectorAll("[data-selected]");
+        prevSelected.forEach((el) => {
+          el.removeAttribute("data-selected");
+          el.removeAttribute("data-sel-first");
+          el.removeAttribute("data-sel-last");
+        });
+
+        if (focusedLine && focusedLineSide) {
+          // Compute selection range
+          let selStart = focusedLine;
+          let selEnd = focusedLine;
+          if (
+            selectionAnchor !== null &&
+            selectionAnchorSide === focusedLineSide
+          ) {
+            selStart = Math.min(focusedLine, selectionAnchor);
+            selEnd = Math.max(focusedLine, selectionAnchor);
+          }
+
+          // Mark selected rows
+          for (let lineNum = selStart; lineNum <= selEnd; lineNum++) {
+            const row = container.querySelector(
+              `[data-line-num="${lineNum}"][data-line-side="${focusedLineSide}"]`
+            );
+            if (row) {
+              row.setAttribute("data-selected", "true");
+              if (lineNum === selStart)
+                row.setAttribute("data-sel-first", "true");
+              if (lineNum === selEnd) row.setAttribute("data-sel-last", "true");
+            }
+          }
+        }
+      }
+
+      // 2. Scroll to focused line (after selection update)
+      if (focusedLine && !isDraggingState) {
+        const rowIndex = getRowIndexForLine(focusedLine, focusedLineSide);
+        if (rowIndex !== undefined) {
+          // Use "auto" alignment - only scrolls if needed, keeps row visible
+          virtualizer.scrollToIndex(rowIndex, {
+            align: "auto",
+          });
+
+          // Account for KeybindsBar: if line is near bottom of viewport, scroll a bit more
+          // This prevents lines from being hidden under the bar
+          const scrollEl = parentRef.current;
+          if (scrollEl) {
+            requestAnimationFrame(() => {
+              const item = virtualizer
+                .getVirtualItems()
+                .find((v) => v.index === rowIndex);
+              if (item) {
+                const itemBottom = item.start + item.size;
+                const viewportBottom =
+                  scrollEl.scrollTop + scrollEl.clientHeight;
+                const KEYBINDS_BAR_HEIGHT = 50;
+                // If item is within 50px of viewport bottom, scroll down to give clearance
+                if (itemBottom > viewportBottom - KEYBINDS_BAR_HEIGHT) {
+                  scrollEl.scrollTop += KEYBINDS_BAR_HEIGHT;
+                }
+              }
+            });
+          }
+        }
+      }
+    });
+
+    return () => {
+      if (rafIdRef.current !== null) {
+        cancelAnimationFrame(rafIdRef.current);
+      }
+    };
+  }, [
+    focusedLine,
+    focusedLineSide,
+    selectionAnchor,
+    selectionAnchorSide,
+    isDraggingState,
+    getRowIndexForLine,
+    virtualizer,
+  ]);
+
+  return (
+    <LineDragContext.Provider value={dragValue}>
+      <div ref={parentRef} className="flex-1 overflow-auto themed-scrollbar">
+        <div className="p-4">
+          <div className="border border-border rounded-lg overflow-hidden">
+            <div
+              ref={containerRef}
+              className="relative w-full font-mono text-[0.8rem] [--code-added:theme(colors.green.500)] [--code-removed:theme(colors.orange.600)] diff-line-container"
+              style={{ height: `${virtualizer.getTotalSize()}px` }}
+            >
+              {virtualizer.getVirtualItems().map((virtualRow) => {
+                const row = virtualRows[virtualRow.index];
+                if (!row) return null;
+
+                return (
+                  <div
+                    key={virtualRow.key}
+                    className="absolute top-0 left-0 w-full"
+                    style={{
+                      transform: `translateY(${virtualRow.start}px)`,
+                    }}
+                    data-index={virtualRow.index}
+                    ref={virtualizer.measureElement}
+                  >
+                    <VirtualRowRenderer
+                      row={row}
+                      focusedSkipBlockIndex={focusedSkipBlockIndex}
+                      focusedCommentId={focusedCommentId}
+                      focusedPendingCommentId={focusedPendingCommentId}
+                      editingCommentId={editingCommentId}
+                      editingPendingCommentId={editingPendingCommentId}
+                      replyingToCommentId={replyingToCommentId}
+                      expandSkipBlock={expandSkipBlock}
+                      isExpanding={isExpanding}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      </div>
+    </LineDragContext.Provider>
+  );
+});
+
+// ============================================================================
+// Virtual Row Renderer
+// ============================================================================
+
+interface VirtualRowRendererProps {
+  row: VirtualRowType;
+  // Props passed from parent to avoid per-row selectors
+  focusedSkipBlockIndex: number | null;
+  focusedCommentId: number | null;
+  focusedPendingCommentId: string | null;
+  editingCommentId: number | null;
+  editingPendingCommentId: string | null;
+  replyingToCommentId: number | null;
+  expandSkipBlock: (
+    skipIndex: number,
+    startLine: number,
+    count: number
+  ) => void;
+  isExpanding: (skipIndex: number) => boolean;
+}
+
+const VirtualRowRenderer = memo(function VirtualRowRenderer({
+  row,
+  focusedSkipBlockIndex,
+  focusedCommentId,
+  focusedPendingCommentId,
+  editingCommentId,
+  editingPendingCommentId,
+  replyingToCommentId,
+  expandSkipBlock,
+  isExpanding,
+}: VirtualRowRendererProps) {
+  switch (row.type) {
+    case "skip-spacer":
+      return <div className="h-2" />;
+    case "skip":
+      return (
+        <SkipBlockRow
+          hunk={row.hunk}
+          isFocused={focusedSkipBlockIndex === row.skipIndex}
+          isExpanding={isExpanding(row.skipIndex)}
+          onExpand={() =>
+            expandSkipBlock(row.skipIndex, row.startLine, row.hunk.count)
+          }
+        />
+      );
+    case "line":
+      return <DiffLineRow line={row.line} lineNum={row.lineNum} />;
+    case "split-line":
+      return <SplitDiffLineRow pair={row.pair} />;
+    case "comment-form":
+      return <InlineCommentForm line={row.lineNum} startLine={row.startLine} />;
+    case "pending-comment":
+      return (
+        <PendingCommentItem
+          comment={row.comment}
+          isFocused={focusedPendingCommentId === row.comment.id}
+          isEditing={editingPendingCommentId === row.comment.id}
+        />
+      );
+    case "comment-thread":
+      return (
+        <CommentThread
+          comments={row.comments}
+          focusedCommentId={focusedCommentId}
+          editingCommentId={editingCommentId}
+          replyingToCommentId={replyingToCommentId}
+        />
+      );
+    default:
+      return null;
+  }
+});
+
+// ============================================================================
+// Diff Line Row (Virtualized - div-based)
+// ============================================================================
+
+interface DiffLineRowProps {
+  line: DiffLine;
+  lineNum: number | undefined;
+}
+
+const DiffLineRow = memo(function DiffLineRow({
+  line,
+  lineNum,
+}: DiffLineRowProps) {
+  const store = usePRReviewStore();
+  const {
+    onDragStart,
+    onDragEnter,
+    onDragEnd,
+    onClickFallback,
+    commentingRange,
+    commentRangeLookup,
+  } = useLineDrag();
+
+  // Determine which side this line is on: 'old' for deletes, 'new' for insert/context
+  const lineSide: "old" | "new" = line.type === "delete" ? "old" : "new";
+
+  // Selection highlighting is handled via CSS data attributes (no per-row subscription needed)
+
+  // Compute commenting range state from lifted parent state (Fix 1)
+  const isInCommentingRange = useMemo(() => {
+    if (lineNum === undefined || !commentingRange) return false;
+    return lineNum >= commentingRange.start && lineNum <= commentingRange.end;
+  }, [lineNum, commentingRange]);
+
+  // O(1) lookup for comment range using pre-computed Set (Fix 3)
+  const hasCommentRange = useMemo(() => {
+    if (lineNum === undefined || !commentRangeLookup) return false;
+    return commentRangeLookup.has(lineNum);
+  }, [lineNum, commentRangeLookup]);
+
+  const Tag =
+    line.type === "insert" ? "ins" : line.type === "delete" ? "del" : "span";
+
+  const handleMouseDown = useCallback(
+    (e: React.MouseEvent) => {
+      if (lineNum) {
+        e.preventDefault();
+        onDragStart(lineNum, lineSide, e.shiftKey);
+      }
+    },
+    [lineNum, lineSide, onDragStart]
+  );
+
+  const handleMouseUp = useCallback(() => {
+    onDragEnd();
+  }, [onDragEnd]);
+
+  const handleMouseEnter = useCallback(() => {
+    if (lineNum) {
+      onDragEnter(lineNum, lineSide);
+    }
+  }, [lineNum, lineSide, onDragEnter]);
+
+  const handleClick = useCallback(() => {
+    if (lineNum) {
+      onClickFallback(lineNum, lineSide);
+    }
+  }, [lineNum, lineSide, onClickFallback]);
+
+  // Handle mousedown on content to catch shift+click before browser text selection
+  const handleContentMouseDown = useCallback(
+    (e: React.MouseEvent) => {
+      if (!lineNum) return;
+
+      const state = store.getSnapshot();
+
+      // Shift+click: extend selection from current focus to clicked line
+      if (e.shiftKey && state.focusedLine !== null) {
+        e.preventDefault(); // Prevent browser text selection
+        if (state.selectionAnchor === null) {
+          store.setSelectionAnchor(
+            state.focusedLine,
+            state.focusedLineSide ?? lineSide
+          );
+        }
+        store.setFocusedLine(lineNum, lineSide);
+        return;
+      }
+    },
+    [lineNum, lineSide, store]
+  );
+
+  // Click on code content to focus line (but not if user is selecting text)
+  const handleContentClick = useCallback(
+    (e: React.MouseEvent) => {
+      if (!lineNum) return;
+
+      // Shift+click is handled in mousedown
+      if (e.shiftKey) return;
+
+      // Check if user has made a text selection
+      const selection = window.getSelection();
+      if (selection && selection.toString().length > 0) {
+        return; // Don't focus if user is selecting text
+      }
+
+      // Normal click: focus the line (clear any selection)
+      store.setFocusedLine(lineNum, lineSide);
+      store.setSelectionAnchor(null, null);
+    },
+    [lineNum, lineSide, store]
+  );
+
+  // Styles for non-selection highlighting (selection is handled via CSS data attributes)
+  const styles = useMemo(() => {
+    let bgColor: string | undefined;
+
+    // Selection highlighting is now CSS-based via data-selected attribute
+    if (isInCommentingRange) {
+      bgColor = "var(--diff-commenting-bg)"; // opaque blue for commenting range
+    } else if (line.type === "insert") {
+      bgColor = "var(--diff-added-bg)"; // opaque green
+    } else if (line.type === "delete") {
+      bgColor = "var(--diff-removed-bg)"; // opaque orange
+    } else if (hasCommentRange) {
+      bgColor = "var(--diff-comment-bg)"; // opaque yellow
+    }
+
+    const result: React.CSSProperties = {};
+
+    if (bgColor) {
+      result.background = `linear-gradient(${bgColor}, ${bgColor})`;
+      result.backgroundSize = "100% calc(100% + 2px)";
+      result.backgroundRepeat = "no-repeat";
+    }
+
+    return result;
+  }, [isInCommentingRange, line.type, hasCommentRange]);
+
+  return (
+    <div
+      className="flex h-5 min-h-5 whitespace-pre-wrap box-border group contain-layout diff-line-row"
+      style={styles}
+      data-line-num={lineNum}
+      data-line-side={lineSide}
+    >
+      {/* Left border indicator */}
+      <div
+        className={cn(
+          "w-1 shrink-0 border-l-[3px] border-transparent",
+          line.type === "insert" && "!border-[var(--code-added)]/60",
+          line.type === "delete" && "!border-[var(--code-removed)]/80"
+        )}
+      />
+      {/* Old line number (shown for delete and normal lines) */}
+      <div
+        data-line-gutter
+        className={cn(
+          "w-10 shrink-0 tabular-nums text-right opacity-50 pr-2 text-xs select-none pt-0.5",
+          line.type !== "insert" && "cursor-pointer hover:bg-blue-500/20"
+        )}
+        onMouseDown={line.type !== "insert" ? handleMouseDown : undefined}
+        onMouseUp={line.type !== "insert" ? handleMouseUp : undefined}
+        onMouseEnter={line.type !== "insert" ? handleMouseEnter : undefined}
+        onClick={line.type !== "insert" ? handleClick : undefined}
+      >
+        {line.type !== "insert" ? line.oldLineNumber : ""}
+      </div>
+      {/* New line number (shown for insert and normal lines) */}
+      <div
+        data-line-gutter
+        className={cn(
+          "w-10 shrink-0 tabular-nums text-right opacity-50 pr-2 text-xs select-none pt-0.5 border-r border-border/30",
+          line.type !== "delete" && "cursor-pointer hover:bg-blue-500/20"
+        )}
+        onMouseDown={line.type !== "delete" ? handleMouseDown : undefined}
+        onMouseUp={line.type !== "delete" ? handleMouseUp : undefined}
+        onMouseEnter={line.type !== "delete" ? handleMouseEnter : undefined}
+        onClick={line.type !== "delete" ? handleClick : undefined}
+      >
+        {line.type !== "delete" ? line.newLineNumber : ""}
+      </div>
+      {/* Code content - click to focus line (unless selecting text) */}
+      <div
+        className="flex-1 whitespace-pre-wrap break-words pr-6 overflow-hidden pl-2 cursor-text"
+        onMouseDown={handleContentMouseDown}
+        onClick={handleContentClick}
+      >
+        <Tag className="no-underline">
+          {line.content.map((seg, i) => {
+            // For tiny inline changes, use more prominent styling
+            const isTinyChange = seg.type !== "normal" && seg.html.length <= 3;
+            return (
+              <span
+                key={i}
+                className={cn(
+                  seg.type === "insert" &&
+                    "bg-[var(--code-added)]/20 text-green-700 dark:text-green-400",
+                  seg.type === "delete" &&
+                    "bg-[var(--code-removed)]/20 text-orange-700 dark:text-orange-400 line-through decoration-orange-500/50",
+                  // Extra emphasis for tiny changes
+                  isTinyChange &&
+                    seg.type === "insert" &&
+                    "bg-[var(--code-added)]/40 font-semibold",
+                  isTinyChange &&
+                    seg.type === "delete" &&
+                    "bg-[var(--code-removed)]/40 font-semibold"
+                )}
+                dangerouslySetInnerHTML={{ __html: seg.html }}
+              />
+            );
+          })}
+        </Tag>
+      </div>
+    </div>
+  );
+});
+
+// ============================================================================
+// Split Diff Line Row (Side-by-side view)
+// ============================================================================
+
+interface SplitDiffLineRowProps {
+  pair: SplitLinePair;
+}
+
+const SplitDiffLineRow = memo(function SplitDiffLineRow({
+  pair,
+}: SplitDiffLineRowProps) {
+  const store = usePRReviewStore();
+  const {
+    onDragStart,
+    onDragEnter,
+    onDragEnd,
+    onClickFallback,
+    commentingRange,
+    commentRangeLookup,
+  } = useLineDrag();
+
+  const { left, right, lineNum } = pair;
+
+  // Compute commenting range state
+  const isInCommentingRange = useMemo(() => {
+    if (lineNum === undefined || !commentingRange) return false;
+    return lineNum >= commentingRange.start && lineNum <= commentingRange.end;
+  }, [lineNum, commentingRange]);
+
+  const hasCommentRange = useMemo(() => {
+    if (lineNum === undefined || !commentRangeLookup) return false;
+    return commentRangeLookup.has(lineNum);
+  }, [lineNum, commentRangeLookup]);
+
+  // Render one side of the split view
+  const renderSide = (
+    line: DiffLine | null,
+    side: "old" | "new",
+    lineNumber: number | undefined
+  ) => {
+    if (!line) {
+      // Empty cell
+      return (
+        <div className="flex flex-1 min-w-0 bg-muted/30 split-diff-side">
+          <div className="w-0.5 shrink-0" />
+          <div className="w-10 shrink-0 tabular-nums text-right opacity-30 pr-2 text-xs select-none pt-0.5 border-r border-border/30" />
+          <div className="flex-1" />
+        </div>
+      );
+    }
+
+    const handleMouseDown = (e: React.MouseEvent) => {
+      if (lineNumber) {
+        e.preventDefault();
+        onDragStart(lineNumber, side, e.shiftKey);
+      }
+    };
+
+    const handleMouseUp = () => {
+      onDragEnd();
+    };
+
+    const handleMouseEnter = () => {
+      if (lineNumber) {
+        onDragEnter(lineNumber, side);
+      }
+    };
+
+    const handleClick = () => {
+      if (lineNumber) {
+        onClickFallback(lineNumber, side);
+      }
+    };
+
+    const handleContentMouseDown = (e: React.MouseEvent) => {
+      if (!lineNumber) return;
+      const state = store.getSnapshot();
+      if (e.shiftKey && state.focusedLine !== null) {
+        e.preventDefault();
+        if (state.selectionAnchor === null) {
+          store.setSelectionAnchor(
+            state.focusedLine,
+            state.focusedLineSide ?? side
+          );
+        }
+        store.setFocusedLine(lineNumber, side);
+        return;
+      }
+    };
+
+    const handleContentClick = (e: React.MouseEvent) => {
+      if (!lineNumber) return;
+      if (e.shiftKey) return;
+      const selection = window.getSelection();
+      if (selection && selection.toString().length > 0) return;
+      store.setFocusedLine(lineNumber, side);
+      store.setSelectionAnchor(null, null);
+    };
+
+    const isDelete = line.type === "delete";
+    const isInsert = line.type === "insert";
+    const Tag = isInsert ? "ins" : isDelete ? "del" : "span";
+
+    let bgColor: string | undefined;
+    if (isInCommentingRange) {
+      bgColor = "var(--diff-commenting-bg)";
+    } else if (isInsert) {
+      bgColor = "var(--diff-added-bg)";
+    } else if (isDelete) {
+      bgColor = "var(--diff-removed-bg)";
+    } else if (hasCommentRange) {
+      bgColor = "var(--diff-comment-bg)";
+    }
+
+    const bgStyle: React.CSSProperties = bgColor
+      ? {
+          background: `linear-gradient(${bgColor}, ${bgColor})`,
+          backgroundSize: "100% calc(100% + 2px)",
+          backgroundRepeat: "no-repeat",
+        }
+      : {};
+
+    return (
+      <div
+        className="flex flex-1 min-w-0 split-diff-side"
+        style={bgStyle}
+        data-line-num={lineNumber}
+        data-line-side={side}
+      >
+        {/* Left border indicator */}
+        <div
+          className={cn(
+            "w-0.5 shrink-0 border-l-2 border-transparent",
+            isInsert && "!border-[var(--code-added)]/60",
+            isDelete && "!border-[var(--code-removed)]/80"
+          )}
+        />
+        {/* Line number */}
+        <div
+          data-line-gutter
+          className="w-10 shrink-0 tabular-nums text-right opacity-50 pr-2 text-xs select-none pt-0.5 cursor-pointer hover:bg-blue-500/20 border-r border-border/30"
+          onMouseDown={handleMouseDown}
+          onMouseUp={handleMouseUp}
+          onMouseEnter={handleMouseEnter}
+          onClick={handleClick}
+        >
+          {lineNumber || ""}
+        </div>
+        {/* Code content */}
+        <div
+          className="flex-1 whitespace-pre-wrap break-words pr-2 overflow-hidden pl-2 cursor-text"
+          onMouseDown={handleContentMouseDown}
+          onClick={handleContentClick}
+        >
+          <Tag className="no-underline">
+            {line.content.map((seg, i) => {
+              // In split view, only show relevant segment types per side
+              // Left (old) side: only highlight deletes, not inserts
+              // Right (new) side: only highlight inserts, not deletes
+              const showInsert = side === "new" && seg.type === "insert";
+              const showDelete = side === "old" && seg.type === "delete";
+              const isTinyChange =
+                (showInsert || showDelete) && seg.html.length <= 3;
+              return (
+                <span
+                  key={i}
+                  className={cn(
+                    showInsert &&
+                      "bg-[var(--code-added)]/20 text-green-700 dark:text-green-400",
+                    showDelete &&
+                      "bg-[var(--code-removed)]/20 text-orange-700 dark:text-orange-400 line-through decoration-orange-500/50",
+                    isTinyChange &&
+                      showInsert &&
+                      "bg-[var(--code-added)]/40 font-semibold",
+                    isTinyChange &&
+                      showDelete &&
+                      "bg-[var(--code-removed)]/40 font-semibold"
+                  )}
+                  dangerouslySetInnerHTML={{ __html: seg.html }}
+                />
+              );
+            })}
+          </Tag>
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <div
+      className="flex h-5 min-h-5 whitespace-pre-wrap box-border group contain-layout split-diff-line-row font-mono text-[0.8rem]"
+      data-line-num={lineNum}
+    >
+      {/* Left side (old/delete) */}
+      {renderSide(left, "old", left?.oldLineNumber)}
+      {/* Divider */}
+      <div className="w-px bg-border/50 shrink-0" />
+      {/* Right side (new/insert) */}
+      {renderSide(right, "new", right?.newLineNumber)}
+    </div>
+  );
+});
+
+// ============================================================================
+// Skip Block Row (Virtualized - div-based)
+// ============================================================================
+
+interface SkipBlockRowProps {
+  hunk: DiffSkipBlock;
+  isFocused?: boolean;
+  isExpanding?: boolean;
+  onExpand?: () => void;
+}
+
+const SkipBlockRow = memo(function SkipBlockRow({
+  hunk,
+  isFocused,
+  isExpanding,
+  onExpand,
+}: SkipBlockRowProps) {
+  const skipBlockRef = useRef<HTMLDivElement>(null);
+
+  const handleClick = useCallback(() => {
+    if (onExpand && !isExpanding) {
+      onExpand();
+    }
+  }, [onExpand, isExpanding]);
+
+  // Scroll into view when focused
+  useEffect(() => {
+    if (isFocused && skipBlockRef.current) {
+      skipBlockRef.current.scrollIntoView({
+        block: "center",
+        behavior: "instant",
+      });
+    }
+  }, [isFocused]);
+
+  return (
+    <div
+      ref={skipBlockRef}
+      onClick={handleClick}
+      className={cn(
+        "flex items-center h-10 font-mono bg-muted text-muted-foreground transition-colors group",
+        isExpanding ? "opacity-60" : "hover:bg-muted/80 cursor-pointer",
+        isFocused && "ring-2 ring-blue-500 ring-inset bg-blue-500/10"
+      )}
+    >
+      <div className="w-1 shrink-0" />
+      {/* Two line number columns to match diff lines */}
+      <div
+        className={cn(
+          "w-10 shrink-0 opacity-50 select-none flex items-center justify-center group-hover:opacity-70",
+          isFocused && "opacity-70"
+        )}
+      >
+        {isExpanding ? (
+          <Loader2 className="w-4 h-4 animate-spin" />
+        ) : (
+          <ChevronsUpDown className="w-4 h-4" />
+        )}
+      </div>
+      <div className="w-10 shrink-0 border-r border-border/30" />
+      <div className="flex-1">
+        <span
+          className={cn(
+            "pl-2 italic opacity-50 group-hover:opacity-70",
+            isFocused && "opacity-70"
+          )}
+        >
+          {hunk.content || `${hunk.count} lines hidden`}
+        </span>
+        {!isExpanding && !isFocused && (
+          <span className="ml-2 text-xs opacity-0 group-hover:opacity-50 transition-opacity">
+            Click to expand
+          </span>
+        )}
+        {!isExpanding && isFocused && (
+          <span className="ml-2 text-xs text-blue-700 dark:text-blue-400 opacity-70">
+            Press Enter to expand
+          </span>
+        )}
+        {isExpanding && (
+          <span className="ml-2 text-xs opacity-50">Loading...</span>
+        )}
+      </div>
+    </div>
+  );
+});
+
+// ============================================================================
+// Inline Comment Form
+// ============================================================================
+
+interface InlineCommentFormProps {
+  line: number;
+  startLine?: number;
+}
+
+const InlineCommentForm = memo(function InlineCommentForm({
+  line,
+  startLine,
+}: InlineCommentFormProps) {
+  const store = usePRReviewStore();
+  const canWrite = useCanWrite();
+  const currentUser = useCurrentUser();
+  const { reconnect } = useAuth();
+  const { addPendingComment } = useCommentActions();
+  const [text, setText] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
+  const handleSubmit = useCallback(async () => {
+    if (!text.trim()) return;
+
+    setSubmitting(true);
+    try {
+      await addPendingComment(line, text.trim(), startLine);
+      setText("");
+    } finally {
+      setSubmitting(false);
+    }
+  }, [text, line, startLine, addPendingComment]);
+
+  const handleKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+        e.preventDefault();
+        handleSubmit();
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        store.cancelCommenting();
+      }
+    },
+    [handleSubmit, store]
+  );
+
+  const lineLabel = startLine ? `lines ${startLine}-${line}` : `line ${line}`;
+
+  // Show sign-in prompt for read-only users
+  if (!canWrite) {
+    return (
+      <div className="mx-4 my-3 rounded-lg border border-amber-500/30 bg-amber-500/5 overflow-hidden shadow-sm">
+        <div className="flex items-center justify-between px-4 py-3 border-b border-amber-500/20">
+          <div className="flex items-center gap-2.5 text-sm font-medium text-amber-700 dark:text-amber-200">
+            <MessageSquare className="w-4 h-4 text-amber-700 dark:text-amber-400" />
+            <span>Comment on {lineLabel}</span>
+          </div>
+          <button
+            onClick={store.cancelCommenting}
+            className="text-muted-foreground hover:text-foreground transition-colors p-1 rounded hover:bg-muted/50"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+        <div className="p-4 flex items-center gap-3">
+          <span className="text-sm text-muted-foreground">
+            Connect GitHub CLI to leave comments
+          </span>
+          <button
+            onClick={reconnect}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium rounded-md bg-green-600 text-white hover:bg-green-700 transition-colors"
+          >
+            Retry connection
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className="mx-4 my-3 rounded-lg border border-border bg-card overflow-hidden shadow-sm"
+      style={{ fontFamily: "var(--font-sans)" }}
+    >
+      {/* Header with avatar and title */}
+      <div className="flex items-center justify-between px-4 py-3 border-b border-border bg-muted/30">
+        <div className="flex items-center gap-3">
+          {currentUser?.avatar_url ? (
+            <img
+              src={currentUser.avatar_url}
+              alt={currentUser.login}
+              className="w-6 h-6 rounded-full ring-1 ring-border"
+            />
+          ) : (
+            <div className="w-6 h-6 rounded-full bg-muted flex items-center justify-center">
+              <MessageSquare className="w-3 h-3 text-muted-foreground" />
+            </div>
+          )}
+          <span className="text-sm font-medium text-foreground">
+            Add comment on {lineLabel}
+          </span>
+        </div>
+        <button
+          onClick={store.cancelCommenting}
+          className="text-muted-foreground hover:text-foreground transition-colors p-1 rounded hover:bg-muted/50"
+        >
+          <X className="w-4 h-4" />
+        </button>
+      </div>
+
+      {/* Editor area */}
+      <div className="p-3">
+        <MarkdownEditor
+          value={text}
+          onChange={setText}
+          onKeyDown={handleKeyDown}
+          placeholder="Leave a comment..."
+          minHeight="100px"
+          autoFocus
+        />
+      </div>
+
+      {/* Action buttons */}
+      <div
+        className="flex items-center justify-end gap-2 px-4 py-3 border-t border-border bg-muted/20"
+        style={{ fontFamily: "var(--font-sans)" }}
+      >
+        <button
+          onClick={store.cancelCommenting}
+          className="px-4 py-2 text-sm font-medium rounded-md border border-border bg-background hover:bg-muted transition-colors"
+          style={{ fontFamily: "var(--font-sans)" }}
+        >
+          Cancel
+        </button>
+        <button
+          onClick={handleSubmit}
+          disabled={!text.trim() || submitting}
+          className="flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-md bg-green-600 text-white hover:bg-green-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          style={{ fontFamily: "var(--font-sans)" }}
+        >
+          {submitting ? (
+            <Loader2 className="w-4 h-4 animate-spin" />
+          ) : (
+            <Send className="w-4 h-4" />
+          )}
+          Add to review
+        </button>
+      </div>
+    </div>
+  );
+});
+
+// ============================================================================
+// Comment Thread
+// ============================================================================
+
+interface CommentThreadProps {
+  comments: ReviewComment[];
+  focusedCommentId: number | null;
+  editingCommentId: number | null;
+  replyingToCommentId: number | null;
+}
+
+const CommentThread = memo(function CommentThread({
+  comments,
+  focusedCommentId,
+  editingCommentId,
+  replyingToCommentId,
+}: CommentThreadProps) {
+  const store = usePRReviewStore();
+  const canWrite = useCanWrite();
+  const owner = usePRReviewSelector((s) => s.owner);
+  const repo = usePRReviewSelector((s) => s.repo);
+  const { replyToComment, updateComment, deleteComment } = useCommentActions();
+  const { resolveThread, unresolveThread } = useThreadActions();
+  const [replyText, setReplyText] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [isCollapsed, setIsCollapsed] = useState(false);
+  const [resolving, setResolving] = useState(false);
+
+  const replyingTo =
+    comments.find((c) => c.id === replyingToCommentId)?.id ?? null;
+
+  // Get resolution info from first comment (all comments in thread share same resolution status)
+  const firstComment = comments[0];
+  const isResolved = firstComment?.is_resolved ?? false;
+  const threadId = firstComment?.pull_request_review_thread_id;
+
+  const handleSubmitReply = useCallback(async () => {
+    if (!replyText.trim() || !replyingTo) return;
+
+    setSubmitting(true);
+    try {
+      await replyToComment(replyingTo, replyText.trim());
+      setReplyText("");
+    } finally {
+      setSubmitting(false);
+    }
+  }, [replyText, replyingTo, replyToComment]);
+
+  const handleKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+        e.preventDefault();
+        handleSubmitReply();
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        store.cancelReplying();
+        setReplyText("");
+      }
+    },
+    [handleSubmitReply, store]
+  );
+
+  const handleCancel = useCallback(() => {
+    store.cancelReplying();
+    setReplyText("");
+  }, [store]);
+
+  const handleResolve = useCallback(async () => {
+    if (!threadId) return;
+    setResolving(true);
+    try {
+      await resolveThread(threadId);
+      // Auto-collapse when resolved
+      setIsCollapsed(true);
+    } finally {
+      setResolving(false);
+    }
+  }, [threadId, resolveThread]);
+
+  const handleUnresolve = useCallback(async () => {
+    if (!threadId) return;
+    setResolving(true);
+    try {
+      await unresolveThread(threadId);
+      setIsCollapsed(false);
+    } finally {
+      setResolving(false);
+    }
+  }, [threadId, unresolveThread]);
+
+  // Auto-collapse resolved threads
+  useEffect(() => {
+    if (isResolved) {
+      setIsCollapsed(true);
+    }
+  }, [isResolved]);
+
+  return (
+    <div
+      data-comment-thread
+      className={cn(
+        "mx-4 my-2 rounded-r-lg border-l-2",
+        isResolved
+          ? "border-green-500/50 bg-green-500/5"
+          : "border-blue-500/50 bg-card/80"
+      )}
+    >
+      {/* Thread header with resolve/unresolve */}
+      <div className="flex items-center justify-between px-4 py-2 border-b border-border/30">
+        <div className="flex items-center gap-2">
+          {isResolved ? (
+            <CheckCircle2 className="w-4 h-4 text-green-500" />
+          ) : (
+            <Circle className="w-4 h-4 text-muted-foreground" />
+          )}
+          <span
+            className={cn(
+              "text-xs font-medium",
+              isResolved ? "text-green-500" : "text-muted-foreground"
+            )}
+          >
+            {isResolved
+              ? "Resolved"
+              : `${comments.length} comment${comments.length !== 1 ? "s" : ""}`}
+          </span>
+          {isResolved && isCollapsed && (
+            <span className="text-xs text-muted-foreground">
+              by {firstComment.user.login}
+            </span>
+          )}
+        </div>
+        <div className="flex items-center gap-2">
+          {canWrite && threadId && (
+            <button
+              onClick={isResolved ? handleUnresolve : handleResolve}
+              disabled={resolving}
+              className={cn(
+                "flex items-center gap-1 px-2 py-1 text-xs rounded transition-colors",
+                isResolved
+                  ? "text-muted-foreground hover:text-foreground hover:bg-muted"
+                  : "text-green-500 hover:bg-green-500/10"
+              )}
+            >
+              {resolving ? (
+                <Loader2 className="w-3 h-3 animate-spin" />
+              ) : isResolved ? (
+                <>
+                  <Circle className="w-3 h-3" />
+                  Unresolve
+                </>
+              ) : (
+                <>
+                  <CheckCircle2 className="w-3 h-3" />
+                  Resolve
+                </>
+              )}
+            </button>
+          )}
+          {isResolved && (
+            <button
+              onClick={() => setIsCollapsed(!isCollapsed)}
+              className="p-1 text-muted-foreground hover:text-foreground rounded transition-colors"
+            >
+              {isCollapsed ? (
+                <ChevronDown className="w-4 h-4" />
+              ) : (
+                <ChevronUp className="w-4 h-4" />
+              )}
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Comment content (collapsible for resolved) */}
+      {!isCollapsed && (
+        <>
+          {comments.map((comment, idx) => (
+            <CommentItem
+              key={comment.id}
+              comment={comment}
+              isReply={idx > 0}
+              isFocused={focusedCommentId === comment.id}
+              isEditing={editingCommentId === comment.id}
+              isResolved={isResolved}
+              onUpdate={updateComment}
+              onDelete={deleteComment}
+              owner={owner}
+              repo={repo}
+            />
+          ))}
+
+          {canWrite && replyingTo && (
+            <div className="px-4 py-3 border-t border-border/50">
+              <MarkdownEditor
+                value={replyText}
+                onChange={setReplyText}
+                onKeyDown={handleKeyDown}
+                placeholder="Write a reply..."
+                minHeight="60px"
+                autoFocus
+              />
+              <div className="flex justify-end gap-2 mt-3">
+                <button
+                  onClick={handleCancel}
+                  className="px-3 py-1.5 text-sm rounded-md hover:bg-muted transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={handleSubmitReply}
+                  disabled={!replyText.trim() || submitting}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md bg-primary text-primary-foreground hover:bg-primary/90 transition-colors disabled:opacity-50"
+                >
+                  <Send className="w-3.5 h-3.5" />
+                  Reply
+                </button>
+              </div>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+});
+
+// ============================================================================
+// Comment Item
+// ============================================================================
+
+interface CommentItemProps {
+  comment: ReviewComment;
+  isReply?: boolean;
+  isFocused?: boolean;
+  isEditing?: boolean;
+  isResolved?: boolean;
+  onUpdate: (commentId: number, body: string) => Promise<void>;
+  onDelete: (commentId: number) => Promise<void>;
+  owner: string;
+  repo: string;
+}
+
+const CommentItem = memo(function CommentItem({
+  comment,
+  isReply,
+  isFocused,
+  isEditing,
+  isResolved,
+  onUpdate,
+  onDelete,
+  owner,
+  repo,
+}: CommentItemProps) {
+  const store = usePRReviewStore();
+  const github = useGitHubStore();
+  const currentUser = usePRReviewSelector((s) => s.currentUser);
+  const viewerPermission = usePRReviewSelector((s) => s.viewerPermission);
+  const canWrite = useCanWrite();
+  const isOwnComment = currentUser === comment.user.login;
+  // ADMIN and MAINTAIN can edit/delete any comment, WRITE can only edit own comments
+  const canEditComment =
+    canWrite &&
+    (isOwnComment ||
+      viewerPermission === "ADMIN" ||
+      viewerPermission === "MAINTAIN");
+
+  // Reactions state
+  const [reactions, setReactions] = useState<Reaction[]>([]);
+  const [loadingReactions, setLoadingReactions] = useState(false);
+
+  // Fetch reactions on mount
+  useEffect(() => {
+    const fetchReactions = async () => {
+      setLoadingReactions(true);
+      try {
+        const data = await github.getReviewCommentReactions(
+          owner,
+          repo,
+          comment.id
+        );
+        setReactions(data);
+      } catch (error) {
+        console.error("Failed to fetch reactions:", error);
+      } finally {
+        setLoadingReactions(false);
+      }
+    };
+    fetchReactions();
+  }, [github, owner, repo, comment.id]);
+
+  const handleAddReaction = useCallback(
+    async (content: ReactionContent) => {
+      try {
+        const newReaction = await github.addReviewCommentReaction(
+          owner,
+          repo,
+          comment.id,
+          content
+        );
+        setReactions((prev) => [...prev, newReaction]);
+      } catch (error) {
+        console.error("Failed to add reaction:", error);
+      }
+    },
+    [github, owner, repo, comment.id]
+  );
+
+  const handleRemoveReaction = useCallback(
+    async (reactionId: number) => {
+      try {
+        await github.deleteReviewCommentReaction(
+          owner,
+          repo,
+          comment.id,
+          reactionId
+        );
+        setReactions((prev) => prev.filter((r) => r.id !== reactionId));
+      } catch (error) {
+        console.error("Failed to remove reaction:", error);
+      }
+    },
+    [github, owner, repo, comment.id]
+  );
+  const timeAgo = useMemo(
+    () => getTimeAgo(new Date(comment.created_at)),
+    [comment.created_at]
+  );
+  const [editText, setEditText] = useState(comment.body);
+  const [saving, setSaving] = useState(false);
+  const commentRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (isEditing) {
+      setEditText(comment.body);
+    }
+  }, [isEditing, comment.body]);
+
+  useEffect(() => {
+    if (isFocused && commentRef.current) {
+      commentRef.current.scrollIntoView({
+        block: "center",
+        behavior: "instant",
+      });
+    }
+  }, [isFocused]);
+
+  const handleSave = useCallback(async () => {
+    if (!editText.trim() || editText === comment.body) {
+      store.cancelEditing();
+      return;
+    }
+    setSaving(true);
+    try {
+      await onUpdate(comment.id, editText.trim());
+    } finally {
+      setSaving(false);
+    }
+  }, [editText, comment.id, comment.body, onUpdate, store]);
+
+  const handleKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+        e.preventDefault();
+        handleSave();
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        store.cancelEditing();
+      }
+    },
+    [handleSave, store]
+  );
+
+  // Handle click to focus this comment for keyboard navigation
+  const handleClick = useCallback(() => {
+    if (!isEditing) {
+      store.setFocusedCommentId(comment.id);
+    }
+  }, [store, comment.id, isEditing]);
+
+  return (
+    <div
+      ref={commentRef}
+      onClick={handleClick}
+      className={cn(
+        "px-4 py-3 font-sans hover:bg-muted/30 transition-colors",
+        isReply && "pl-12 border-t border-border/30",
+        isFocused && "ring-2 ring-blue-500 ring-inset bg-blue-500/5",
+        isResolved && "opacity-75"
+      )}
+    >
+      <div className="flex items-start gap-3">
+        <img
+          src={comment.user.avatar_url}
+          alt={comment.user.login}
+          className="w-6 h-6 rounded-full shrink-0"
+          loading="lazy"
+        />
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 text-sm">
+            <span className="font-medium">{comment.user.login}</span>
+            <span className="text-muted-foreground text-xs">{timeAgo}</span>
+          </div>
+
+          {isEditing ? (
+            <div className="mt-2">
+              <MarkdownEditor
+                value={editText}
+                onChange={setEditText}
+                onKeyDown={handleKeyDown}
+                placeholder="Edit your comment..."
+                minHeight="60px"
+                autoFocus
+              />
+              <div className="flex justify-end gap-2 mt-3">
+                <button
+                  onClick={store.cancelEditing}
+                  className="px-3 py-1.5 text-sm rounded-md hover:bg-muted transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={handleSave}
+                  disabled={!editText.trim() || saving}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md bg-primary text-primary-foreground hover:bg-primary/90 transition-colors disabled:opacity-50"
+                >
+                  <Check className="w-3.5 h-3.5" />
+                  Save
+                </button>
+              </div>
+            </div>
+          ) : (
+            <>
+              <div className="mt-1 text-sm text-foreground/90">
+                <Markdown html={comment.body_html}>{comment.body}</Markdown>
+              </div>
+
+              {/* Reactions */}
+              <div className="mt-2">
+                <EmojiReactions
+                  reactions={reactions}
+                  onAddReaction={canWrite ? handleAddReaction : undefined}
+                  onRemoveReaction={canWrite ? handleRemoveReaction : undefined}
+                  currentUser={currentUser}
+                />
+              </div>
+
+              <div className="flex items-center gap-3 mt-2">
+                {canWrite && (
+                  <button
+                    onClick={() => store.startReplying(comment.id)}
+                    className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
+                    title="Reply (r)"
+                  >
+                    <Reply className="w-3 h-3" />
+                    Reply
+                    {isFocused && (
+                      <kbd className="ml-0.5 px-1 py-0.5 bg-muted/60 rounded text-[9px] font-mono">
+                        r
+                      </kbd>
+                    )}
+                  </button>
+                )}
+                {canEditComment && (
+                  <>
+                    <button
+                      onClick={() => store.startEditing(comment.id)}
+                      className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
+                      title="Edit (e)"
+                    >
+                      <Pencil className="w-3 h-3" />
+                      Edit
+                      {isFocused && (
+                        <kbd className="ml-0.5 px-1 py-0.5 bg-muted/60 rounded text-[9px] font-mono">
+                          e
+                        </kbd>
+                      )}
+                    </button>
+                    <button
+                      onClick={() => onDelete(comment.id)}
+                      className="flex items-center gap-1 text-xs text-muted-foreground hover:text-destructive transition-colors"
+                      title="Delete (d)"
+                    >
+                      <Trash2 className="w-3 h-3" />
+                      Delete
+                      {isFocused && (
+                        <kbd className="ml-0.5 px-1 py-0.5 bg-muted/60 rounded text-[9px] font-mono">
+                          d
+                        </kbd>
+                      )}
+                    </button>
+                  </>
+                )}
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+});
+
+// ============================================================================
+// Emoji Reactions Component
+// ============================================================================
+
+const REACTION_EMOJIS: Record<ReactionContent, string> = {
+  "+1": "👍",
+  "-1": "👎",
+  laugh: "😄",
+  hooray: "🎉",
+  confused: "😕",
+  heart: "❤️",
+  rocket: "🚀",
+  eyes: "👀",
+};
+
+const REACTION_ORDER: ReactionContent[] = [
+  "+1",
+  "-1",
+  "laugh",
+  "hooray",
+  "confused",
+  "heart",
+  "rocket",
+  "eyes",
+];
+
+function EmojiReactions({
+  reactions,
+  onAddReaction,
+  onRemoveReaction,
+  currentUser,
+}: {
+  reactions: Reaction[];
+  onAddReaction?: (content: ReactionContent) => void;
+  onRemoveReaction?: (reactionId: number) => void;
+  currentUser?: string | null;
+}) {
+  const [showPicker, setShowPicker] = useState(false);
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  const [pickerPosition, setPickerPosition] = useState({ top: 0, left: 0 });
+
+  // Group reactions by content
+  const groupedReactions = useMemo(() => {
+    const groups: Record<
+      string,
+      { count: number; users: string[]; userReactionId?: number }
+    > = {};
+
+    for (const reaction of reactions) {
+      const content = reaction.content as ReactionContent;
+      if (!groups[content]) {
+        groups[content] = { count: 0, users: [] };
+      }
+      groups[content].count++;
+      if (reaction.user?.login) {
+        groups[content].users.push(reaction.user.login);
+        if (reaction.user.login === currentUser) {
+          groups[content].userReactionId = reaction.id;
+        }
+      }
+    }
+
+    return groups;
+  }, [reactions, currentUser]);
+
+  const handleReactionClick = useCallback(
+    (content: ReactionContent) => {
+      const group = groupedReactions[content];
+      if (group?.userReactionId && onRemoveReaction) {
+        // User already reacted, remove it
+        onRemoveReaction(group.userReactionId);
+      } else if (onAddReaction) {
+        // Add new reaction
+        onAddReaction(content);
+      }
+      setShowPicker(false);
+    },
+    [groupedReactions, onAddReaction, onRemoveReaction]
+  );
+
+  const handleTogglePicker = useCallback(() => {
+    if (!showPicker && buttonRef.current) {
+      const rect = buttonRef.current.getBoundingClientRect();
+      setPickerPosition({
+        top: rect.bottom + 4,
+        left: rect.left,
+      });
+    }
+    setShowPicker(!showPicker);
+  }, [showPicker]);
+
+  // Sort reactions to show in consistent order
+  const sortedReactions = useMemo(() => {
+    return REACTION_ORDER.filter(
+      (content) => groupedReactions[content]?.count > 0
+    );
+  }, [groupedReactions]);
+
+  // Format users list for tooltip
+  const formatUsersTooltip = (users: string[], emoji: string) => {
+    if (users.length === 0) return "";
+    if (users.length === 1) return `${users[0]} reacted with ${emoji}`;
+    if (users.length === 2)
+      return `${users[0]} and ${users[1]} reacted with ${emoji}`;
+    if (users.length === 3)
+      return `${users[0]}, ${users[1]}, and ${users[2]} reacted with ${emoji}`;
+    return `${users[0]}, ${users[1]}, and ${users.length - 2} others reacted with ${emoji}`;
+  };
+
+  // Don't render if no reactions and no ability to add
+  if (!onAddReaction && sortedReactions.length === 0) {
+    return null;
+  }
+
+  return (
+    <div
+      className="flex items-center gap-1.5 flex-wrap"
+      style={{ fontFamily: "var(--font-sans)" }}
+    >
+      {/* Add reaction button */}
+      {onAddReaction && (
+        <>
+          <TooltipProvider delayDuration={200}>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  ref={buttonRef}
+                  onClick={handleTogglePicker}
+                  className="inline-flex items-center justify-center w-6 h-6 text-xs rounded-full border border-border hover:border-blue-500/50 text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors"
+                >
+                  <Smile className="w-3.5 h-3.5" />
+                </button>
+              </TooltipTrigger>
+              <TooltipContent>Add reaction</TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+
+          {/* Emoji picker dropdown */}
+          {showPicker && (
+            <>
+              <div
+                className="fixed inset-0 z-[100]"
+                onClick={() => setShowPicker(false)}
+              />
+              <div
+                className="fixed p-2 bg-card border border-border rounded-lg shadow-xl z-[101] flex gap-1"
+                style={{ top: pickerPosition.top, left: pickerPosition.left }}
+              >
+                {REACTION_ORDER.map((content) => (
+                  <button
+                    key={content}
+                    onClick={() => handleReactionClick(content)}
+                    className={cn(
+                      "w-8 h-8 flex items-center justify-center text-lg rounded hover:bg-muted transition-colors",
+                      groupedReactions[content]?.userReactionId &&
+                        "bg-blue-500/20"
+                    )}
+                    title={content}
+                  >
+                    {REACTION_EMOJIS[content]}
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+        </>
+      )}
+
+      {/* Existing reactions */}
+      <TooltipProvider delayDuration={200}>
+        {sortedReactions.map((content) => {
+          const group = groupedReactions[content];
+          const isUserReaction = !!group.userReactionId;
+
+          return (
+            <Tooltip key={content}>
+              <TooltipTrigger asChild>
+                <button
+                  onClick={() => handleReactionClick(content)}
+                  className={cn(
+                    "inline-flex items-center gap-1 px-2 py-0.5 text-xs rounded-full border transition-colors",
+                    isUserReaction
+                      ? "bg-blue-500/20 border-blue-500/50 text-blue-700 dark:text-blue-400"
+                      : "bg-muted/50 border-border hover:border-blue-500/50"
+                  )}
+                >
+                  <span>{REACTION_EMOJIS[content]}</span>
+                  <span>{group.count}</span>
+                </button>
+              </TooltipTrigger>
+              <TooltipContent>
+                {formatUsersTooltip(group.users, REACTION_EMOJIS[content])}
+              </TooltipContent>
+            </Tooltip>
+          );
+        })}
+      </TooltipProvider>
+    </div>
+  );
+}
+
+// ============================================================================
+// Pending Comment Item
+// ============================================================================
+
+interface PendingCommentItemProps {
+  comment: LocalPendingComment;
+  isFocused?: boolean;
+  isEditing?: boolean;
+}
+
+const PendingCommentItem = memo(function PendingCommentItem({
+  comment,
+  isFocused,
+  isEditing,
+}: PendingCommentItemProps) {
+  const store = usePRReviewStore();
+  const { removePendingComment, updatePendingComment } = useCommentActions();
+  const currentUser = usePRReviewSelector((s) => s.currentUser);
+  const [editText, setEditText] = useState(comment.body);
+  const [saving, setSaving] = useState(false);
+  const commentRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (isEditing) {
+      setEditText(comment.body);
+    }
+  }, [isEditing, comment.body]);
+
+  useEffect(() => {
+    if (isFocused && commentRef.current) {
+      commentRef.current.scrollIntoView({
+        block: "center",
+        behavior: "instant",
+      });
+    }
+  }, [isFocused]);
+
+  const handleSave = useCallback(async () => {
+    if (!editText.trim() || editText === comment.body) {
+      store.cancelEditingPendingComment();
+      return;
+    }
+    setSaving(true);
+    try {
+      await updatePendingComment(comment.id, editText.trim());
+    } finally {
+      setSaving(false);
+    }
+  }, [editText, comment.id, comment.body, updatePendingComment, store]);
+
+  const handleKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+        e.preventDefault();
+        handleSave();
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        store.cancelEditingPendingComment();
+      }
+    },
+    [handleSave, store]
+  );
+
+  // Handle click to focus this comment for keyboard navigation
+  const handleClick = useCallback(() => {
+    if (!isEditing) {
+      store.setFocusedPendingCommentId(comment.id);
+    }
+  }, [store, comment.id, isEditing]);
+
+  return (
+    <div
+      ref={commentRef}
+      data-comment-thread
+      className={cn(
+        "border-l-2 border-yellow-500 bg-card/80 mx-4 my-2 rounded-r-lg",
+        isFocused && "ring-2 ring-blue-500 ring-inset"
+      )}
+    >
+      <div
+        onClick={handleClick}
+        className={cn(
+          "px-4 py-3 font-sans hover:bg-muted/30 transition-colors",
+          isFocused && "bg-blue-500/5"
+        )}
+      >
+        <div className="flex items-start gap-3">
+          <img
+            src={`https://github.com/${currentUser || "ghost"}.png`}
+            alt={currentUser || "You"}
+            className="w-6 h-6 rounded-full shrink-0"
+            loading="lazy"
+          />
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center justify-between gap-2 text-sm">
+              <div className="flex items-center gap-2">
+                <span className="font-medium">{currentUser || "You"}</span>
+                <span className="text-muted-foreground text-xs">just now</span>
+                <span className="px-1.5 py-0.5 text-[10px] font-medium bg-yellow-500/20 text-yellow-500 rounded">
+                  Pending
+                </span>
+              </div>
+            </div>
+
+            {isEditing ? (
+              <div className="mt-2">
+                <MarkdownEditor
+                  value={editText}
+                  onChange={setEditText}
+                  onKeyDown={handleKeyDown}
+                  placeholder="Edit your comment..."
+                  minHeight="60px"
+                  autoFocus
+                />
+                <div className="flex justify-end gap-2 mt-3">
+                  <button
+                    onClick={store.cancelEditingPendingComment}
+                    className="px-3 py-1.5 text-sm rounded-md hover:bg-muted transition-colors"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    onClick={handleSave}
+                    disabled={!editText.trim() || saving}
+                    className="flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md bg-primary text-primary-foreground hover:bg-primary/90 transition-colors disabled:opacity-50"
+                  >
+                    <Check className="w-3.5 h-3.5" />
+                    Save
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <>
+                <div className="mt-1 text-sm text-foreground/90">
+                  <Markdown>{comment.body}</Markdown>
+                </div>
+                <div className="flex items-center gap-3 mt-2">
+                  <button
+                    onClick={() => store.startEditingPendingComment(comment.id)}
+                    className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
+                    title="Edit (e)"
+                  >
+                    <Pencil className="w-3 h-3" />
+                    Edit
+                    {isFocused && (
+                      <kbd className="ml-0.5 px-1 py-0.5 bg-muted/60 rounded text-[9px] font-mono">
+                        e
+                      </kbd>
+                    )}
+                  </button>
+                  <button
+                    onClick={() => removePendingComment(comment.id)}
+                    className="flex items-center gap-1 text-xs text-muted-foreground hover:text-destructive transition-colors"
+                    title="Delete (d)"
+                  >
+                    <Trash2 className="w-3 h-3" />
+                    Delete
+                    {isFocused && (
+                      <kbd className="ml-0.5 px-1 py-0.5 bg-muted/60 rounded text-[9px] font-mono">
+                        d
+                      </kbd>
+                    )}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+});
+
+// ============================================================================
+// Submit Review Dropdown (GitHub-style)
+// ============================================================================
+
+const SubmitReviewDropdown = memo(function SubmitReviewDropdown() {
+  const store = usePRReviewStore();
+  const { submitReview } = useReviewActions();
+  const { removePendingComment } = useCommentActions();
+
+  const pendingComments = usePRReviewSelector((s) => s.pendingComments);
+  const reviewBody = usePRReviewSelector((s) => s.reviewBody);
+  const submitting = usePRReviewSelector((s) => s.submittingReview);
+  const pr = usePRReviewSelector((s) => s.pr);
+  const currentUser = usePRReviewSelector((s) => s.currentUser);
+  const viewerPermission = usePRReviewSelector((s) => s.viewerPermission);
+
+  const [reviewType, setReviewType] = useState<
+    "COMMENT" | "APPROVE" | "REQUEST_CHANGES"
+  >("COMMENT");
+  const [isOpen, setIsOpen] = useState(false);
+  const [expandedFile, setExpandedFile] = useState<string | null>(null);
+  const [openedViaKeyboard, setOpenedViaKeyboard] = useState(false);
+
+  // Listen for global event to open the submit review dropdown
+  useEffect(() => {
+    const handleOpenSubmitReview = () => {
+      setOpenedViaKeyboard(true);
+      setIsOpen(true);
+    };
+    window.addEventListener(
+      "pr-review:open-submit-review",
+      handleOpenSubmitReview
+    );
+    return () =>
+      window.removeEventListener(
+        "pr-review:open-submit-review",
+        handleOpenSubmitReview
+      );
+  }, []);
+
+  // Reset openedViaKeyboard when dropdown closes
+  useEffect(() => {
+    if (!isOpen) {
+      setOpenedViaKeyboard(false);
+    }
+  }, [isOpen]);
+
+  // Check if current user is the PR author (can't approve/request changes on own PR)
+  const isAuthor = currentUser !== null && pr.user.login === currentUser;
+
+  // Check if viewer has write access (ADMIN, MAINTAIN, or WRITE can approve/request_changes)
+  // TRIAGE and READ permissions are limited to commenting only
+  const canApproveOrRequestChanges =
+    viewerPermission === "ADMIN" ||
+    viewerPermission === "MAINTAIN" ||
+    viewerPermission === "WRITE";
+
+  // Group pending comments by file
+  const commentsByFile = useMemo(() => {
+    const grouped = new Map<string, LocalPendingComment[]>();
+    for (const comment of pendingComments) {
+      const existing = grouped.get(comment.path) || [];
+      existing.push(comment);
+      grouped.set(comment.path, existing);
+    }
+    return grouped;
+  }, [pendingComments]);
+
+  const pendingCount = pendingComments.length;
+
+  const handleSubmit = useCallback(async () => {
+    await submitReview(reviewType);
+    setIsOpen(false);
+  }, [submitReview, reviewType]);
+
+  // Ctrl/Cmd+Enter to submit review when dropdown is open
+  useEffect(() => {
+    if (!isOpen) return;
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+        e.preventDefault();
+        // Check if submit is allowed
+        const canSubmit =
+          !submitting &&
+          !(
+            reviewType === "COMMENT" &&
+            pendingCount === 0 &&
+            !reviewBody.trim()
+          );
+        if (canSubmit) {
+          handleSubmit();
+        }
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [isOpen, submitting, reviewType, pendingCount, reviewBody, handleSubmit]);
+
+  const handleJumpToComment = useCallback(
+    (comment: LocalPendingComment) => {
+      store.selectFile(comment.path);
+      // Small delay to let the file load, then focus the pending comment
+      setTimeout(() => {
+        store.setFocusedPendingCommentId(comment.id);
+      }, 100);
+      setIsOpen(false);
+    },
+    [store]
+  );
+
+  return (
+    <DropdownMenu open={isOpen} onOpenChange={setIsOpen} modal={false}>
+      <DropdownMenuTrigger asChild>
+        <button className="flex items-center gap-1.5 px-2 py-1 text-xs font-medium rounded-md bg-green-600 text-white hover:bg-green-700 transition-colors">
+          <span>Submit review</span>
+          {pendingCount > 0 && (
+            <span className="px-1 py-0.5 text-[10px] bg-green-500/50 rounded">
+              {pendingCount}
+            </span>
+          )}
+          <span className="px-1 py-0.5 text-[10px] bg-green-500/50 rounded font-mono">
+            S
+          </span>
+          <ChevronsUpDown className="w-3.5 h-3.5 opacity-70" />
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-[450px]">
+        <DropdownMenuLabel className="font-semibold">
+          Finish your review
+        </DropdownMenuLabel>
+        <DropdownMenuSeparator />
+
+        {/* Review body */}
+        <div className="p-3" onClick={(e) => e.stopPropagation()}>
+          <MarkdownEditor
+            value={reviewBody}
+            onChange={(v) => store.setReviewBody(v)}
+            placeholder="Leave a comment"
+            minHeight="80px"
+            autoFocus={openedViaKeyboard}
+          />
+        </div>
+
+        {/* Pending comments by file */}
+        {pendingCount > 0 && (
+          <div className="px-3 pb-2">
+            <div className="flex items-center justify-between text-xs text-muted-foreground mb-2">
+              <span className="font-medium">
+                {pendingCount} pending comment{pendingCount !== 1 ? "s" : ""}
+              </span>
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  pendingComments.forEach((c) => removePendingComment(c.id));
+                }}
+                className="text-destructive hover:underline"
+              >
+                Clear all
+              </button>
+            </div>
+
+            {/* File list with comments */}
+            <div className="max-h-[200px] overflow-y-auto space-y-1 themed-scrollbar">
+              {Array.from(commentsByFile.entries()).map(
+                ([filePath, comments]) => {
+                  const fileName = filePath.split("/").pop() || filePath;
+                  const isExpanded = expandedFile === filePath;
+
+                  return (
+                    <div
+                      key={filePath}
+                      className="rounded-md border border-border/50 overflow-hidden"
+                    >
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setExpandedFile(isExpanded ? null : filePath);
+                        }}
+                        className="w-full flex items-center gap-2 px-2 py-1.5 text-xs hover:bg-muted/50 transition-colors"
+                      >
+                        {isExpanded ? (
+                          <ChevronDown className="w-3 h-3 shrink-0" />
+                        ) : (
+                          <ChevronRight className="w-3 h-3 shrink-0" />
+                        )}
+                        <FileCode className="w-3 h-3 shrink-0 text-muted-foreground" />
+                        <span className="font-mono truncate flex-1 text-left">
+                          {fileName}
+                        </span>
+                        <span className="px-1.5 py-0.5 bg-yellow-500/20 text-yellow-500 rounded text-[10px]">
+                          {comments.length}
+                        </span>
+                      </button>
+
+                      {isExpanded && (
+                        <div className="border-t border-border/50 bg-muted/30">
+                          {comments.map((comment) => (
+                            <button
+                              key={comment.id}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleJumpToComment(comment);
+                              }}
+                              className="w-full flex items-start gap-2 px-3 py-2 text-xs hover:bg-muted/50 transition-colors text-left border-b border-border/30 last:border-b-0"
+                            >
+                              <span className="font-mono text-muted-foreground shrink-0">
+                                L
+                                {comment.start_line
+                                  ? `${comment.start_line}-`
+                                  : ""}
+                                {comment.line}
+                              </span>
+                              <span className="text-foreground/80 line-clamp-2 flex-1">
+                                {comment.body}
+                              </span>
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  );
+                }
+              )}
+            </div>
+          </div>
+        )}
+
+        <DropdownMenuSeparator />
+
+        {/* Review type radio options */}
+        <div className="px-3 py-2">
+          <RadioGroup
+            value={reviewType}
+            onValueChange={(v) => setReviewType(v as typeof reviewType)}
+            className="gap-2"
+          >
+            <label className="flex items-start gap-3 cursor-pointer group">
+              <RadioGroupItem value="COMMENT" className="mt-0.5" />
+              <div className="flex flex-col gap-0.5">
+                <span className="font-medium text-sm">Comment</span>
+                <span className="text-xs text-muted-foreground">
+                  Submit general feedback without explicit approval.
+                </span>
+              </div>
+            </label>
+
+            {!isAuthor && canApproveOrRequestChanges && (
+              <>
+                <label className="flex items-start gap-3 cursor-pointer group">
+                  <RadioGroupItem value="APPROVE" className="mt-0.5" />
+                  <div className="flex flex-col gap-0.5">
+                    <span className="font-medium text-sm text-green-700 dark:text-green-400">
+                      Approve
+                    </span>
+                    <span className="text-xs text-muted-foreground">
+                      Submit feedback and approve merging these changes.
+                    </span>
+                  </div>
+                </label>
+
+                <label className="flex items-start gap-3 cursor-pointer group">
+                  <RadioGroupItem value="REQUEST_CHANGES" className="mt-0.5" />
+                  <div className="flex flex-col gap-0.5">
+                    <span className="font-medium text-sm text-amber-700 dark:text-amber-400">
+                      Request changes
+                    </span>
+                    <span className="text-xs text-muted-foreground">
+                      Submit feedback suggesting changes.
+                    </span>
+                  </div>
+                </label>
+              </>
+            )}
+
+            {/* Show explanation when user cannot approve */}
+            {!isAuthor && !canApproveOrRequestChanges && viewerPermission && (
+              <div className="flex items-start gap-2 px-1 py-2 text-xs text-muted-foreground bg-muted/30 rounded-md">
+                <ExternalLink className="w-3.5 h-3.5 mt-0.5 shrink-0" />
+                <span>
+                  You can only comment on this PR. The{" "}
+                  <span className="font-medium">
+                    {pr.base.repo.owner.login}
+                  </span>{" "}
+                  organization has OAuth app restrictions enabled.{" "}
+                  <a
+                    href="https://docs.github.com/en/organizations/managing-oauth-access-to-your-organizations-data/approving-oauth-apps-for-your-organization"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-primary hover:underline"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    Learn more
+                  </a>
+                </span>
+              </div>
+            )}
+          </RadioGroup>
+        </div>
+
+        <DropdownMenuSeparator />
+
+        {/* Submit buttons */}
+        <div className="p-2 flex justify-end gap-2">
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              setIsOpen(false);
+            }}
+            className="px-2 py-1 text-xs rounded-md hover:bg-muted transition-colors"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              handleSubmit();
+            }}
+            disabled={
+              submitting ||
+              (reviewType === "COMMENT" &&
+                pendingCount === 0 &&
+                !reviewBody.trim())
+            }
+            className={cn(
+              "flex items-center gap-1.5 px-2 py-1 text-xs font-medium rounded-md transition-colors disabled:opacity-50",
+              reviewType === "APPROVE" &&
+                "bg-green-500/20 text-green-700 dark:text-green-400 hover:bg-green-500/30 border border-green-500/30",
+              reviewType === "REQUEST_CHANGES" &&
+                "bg-amber-500/20 text-amber-700 dark:text-amber-400 hover:bg-amber-500/30 border border-amber-500/30",
+              reviewType === "COMMENT" &&
+                "bg-primary text-primary-foreground hover:bg-primary/90"
+            )}
+          >
+            {submitting ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            ) : reviewType === "APPROVE" ? (
+              <Check className="w-3.5 h-3.5" />
+            ) : reviewType === "REQUEST_CHANGES" ? (
+              <XCircle className="w-3.5 h-3.5" />
+            ) : (
+              <MessageSquare className="w-3.5 h-3.5" />
+            )}
+            Submit review
+          </button>
+        </div>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+});
+
+// ============================================================================
+// Skeleton Components
+// ============================================================================
+
+function PRReviewSkeleton() {
+  // Check URL hash to determine which skeleton to show
+  // If hash contains file=, user navigated directly to a file
+  const hash = window.location.hash;
+  const showFileSkeleton = hash.includes("file=");
+
+  return (
+    <div className="flex flex-col h-full">
+      {/* Header skeleton - single row matching PRHeader */}
+      <div className="shrink-0 border-b border-border bg-card/30 px-2 sm:px-4 py-2">
+        <div className="flex items-center gap-2 sm:gap-3">
+          <Skeleton className="h-6 w-16 rounded-full" />
+          <Skeleton className="h-4 w-24 hidden sm:block" />
+          <Skeleton className="h-5 flex-1 max-w-md" />
+          <Skeleton className="h-5 w-5 rounded-full" />
+          <Skeleton className="h-4 w-16 hidden sm:block" />
+          <Skeleton className="h-4 w-4" />
+        </div>
+      </div>
+
+      <div className="flex flex-1 overflow-hidden min-h-0">
+        {/* File panel skeleton */}
+        <aside className="w-64 border-r border-border flex flex-col overflow-hidden shrink-0">
+          <div className="mx-2 my-2 flex items-center gap-1.5">
+            <Skeleton className="flex-1 h-8" />
+            <Skeleton className="w-8 h-8" />
+          </div>
+          <Skeleton className="mx-2 mb-1 h-8" />
+          <div className="border-t border-border/50 mt-1" />
+          <div className="flex-1 p-2 space-y-1">
+            {[70, 55, 80, 45, 65, 90, 50, 75, 60, 85, 40, 70].map(
+              (width, i) => (
+                <div key={i} className="flex items-center gap-2 px-2 py-1">
+                  <Skeleton className="w-4 h-4" />
+                  <Skeleton className="h-4" style={{ width: `${width}%` }} />
+                </div>
+              )
+            )}
+          </div>
+        </aside>
+
+        {/* Main content skeleton - show diff or overview based on URL hash */}
+        <main className="flex-1 overflow-hidden flex flex-col">
+          {showFileSkeleton ? <DiffSkeleton /> : <OverviewPanelSkeleton />}
+        </main>
+      </div>
+    </div>
+  );
+}
+
+function OverviewPanelSkeleton() {
+  return (
+    <div className="flex-1 overflow-auto bg-background">
+      {/* Tabs skeleton */}
+      <div className="border-b border-border">
+        <div className="max-w-[1280px] mx-auto px-6">
+          <div className="flex items-center gap-4 py-2">
+            <Skeleton className="h-8 w-32" />
+            <Skeleton className="h-8 w-24" />
+            <Skeleton className="h-8 w-20" />
+          </div>
+        </div>
+      </div>
+
+      {/* Main Content skeleton */}
+      <div className="max-w-[1280px] mx-auto px-6 py-6">
+        <div className="flex gap-6">
+          {/* Left Column */}
+          <div className="flex-1 min-w-0 space-y-4">
+            {/* PR Description skeleton */}
+            <div className="border border-border rounded-md overflow-hidden">
+              <div className="flex items-center gap-2 px-4 py-2 border-b border-border bg-card/50">
+                <Skeleton className="w-5 h-5 rounded-full" />
+                <Skeleton className="h-4 w-24" />
+                <Skeleton className="h-3 w-20" />
+              </div>
+              <div className="p-4 space-y-2">
+                <Skeleton className="h-4 w-full" />
+                <Skeleton className="h-4 w-[90%]" />
+                <Skeleton className="h-4 w-[75%]" />
+                <Skeleton className="h-4 w-[85%]" />
+                <Skeleton className="h-4 w-[60%]" />
+              </div>
+            </div>
+
+            {/* Timeline items skeleton */}
+            {Array.from({ length: 2 }).map((_, i) => (
+              <div
+                key={i}
+                className="border border-border rounded-md overflow-hidden"
+              >
+                <div className="flex items-center gap-2 px-4 py-2 border-b border-border bg-card/50">
+                  <Skeleton className="w-5 h-5 rounded-full" />
+                  <Skeleton className="h-4 w-24" />
+                  <Skeleton className="h-3 w-20" />
+                </div>
+                <div className="p-4 space-y-2">
+                  <Skeleton className="h-4 w-full" />
+                  <Skeleton className="h-4 w-[90%]" />
+                </div>
+              </div>
+            ))}
+
+            {/* Merge section skeleton */}
+            <div className="border border-border rounded-md overflow-hidden">
+              {Array.from({ length: 2 }).map((_, i) => (
+                <div
+                  key={i}
+                  className="flex items-center gap-3 p-4 border-b border-border last:border-b-0"
+                >
+                  <Skeleton className="w-5 h-5 rounded-full" />
+                  <div className="flex-1 space-y-1">
+                    <Skeleton className="h-4 w-48" />
+                    <Skeleton className="h-3 w-64" />
+                  </div>
+                </div>
+              ))}
+              <div className="p-4">
+                <Skeleton className="h-10 w-full" />
+              </div>
+            </div>
+          </div>
+
+          {/* Right Column - Sidebar skeleton */}
+          <div className="w-[296px] shrink-0 space-y-4 hidden lg:block">
+            {/* Reviewers */}
+            <div className="pb-3 border-b border-border">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-xs font-semibold text-muted-foreground">
+                  Reviewers
+                </span>
+                <Skeleton className="w-4 h-4" />
+              </div>
+              <div className="space-y-2">
+                {Array.from({ length: 2 }).map((_, i) => (
+                  <div key={i} className="flex items-center gap-2">
+                    <Skeleton className="w-5 h-5 rounded-full" />
+                    <Skeleton className="h-4 w-24" />
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Labels */}
+            <div className="pb-3 border-b border-border">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-xs font-semibold text-muted-foreground">
+                  Labels
+                </span>
+                <Skeleton className="w-4 h-4" />
+              </div>
+              <div className="flex items-center gap-1.5 flex-wrap">
+                {Array.from({ length: 3 }).map((_, i) => (
+                  <Skeleton key={i} className="h-5 w-16 rounded-full" />
+                ))}
+              </div>
+            </div>
+
+            {/* Participants */}
+            <div className="pb-3 border-b border-border">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-xs font-semibold text-muted-foreground">
+                  Participants
+                </span>
+              </div>
+              <div className="flex items-center gap-1">
+                {Array.from({ length: 4 }).map((_, i) => (
+                  <Skeleton key={i} className="w-6 h-6 rounded-full" />
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Deterministic widths for skeleton lines to avoid re-render flicker
+const SKELETON_LINE_WIDTHS = [
+  65, 45, 80, 30, 55, 70, 40, 85, 50, 60, 75, 35, 90, 45, 55, 70, 25, 80, 60,
+  50,
+];
+
+function DiffSkeleton() {
+  return (
+    <div className="flex-1 overflow-auto p-4">
+      <div className="border border-border rounded-lg overflow-hidden">
+        <div className="font-mono text-[0.8rem]">
+          {/* Hunk header skeleton */}
+          <div className="bg-muted/50 px-4 py-2 border-b border-border">
+            <Skeleton className="h-4 w-48" />
+          </div>
+
+          {/* Diff lines skeleton */}
+          {SKELETON_LINE_WIDTHS.map((width, i) => (
+            <DiffLineSkeleton
+              key={i}
+              type={i % 7 === 3 ? "add" : i % 7 === 5 ? "remove" : "normal"}
+              width={width}
+            />
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DiffLineSkeleton({
+  type = "normal",
+  width,
+}: {
+  type?: "add" | "remove" | "normal";
+  width: number;
+}) {
+  const bgClass =
+    type === "add"
+      ? "bg-green-500/5"
+      : type === "remove"
+        ? "bg-orange-500/5"
+        : "";
+
+  return (
+    <div className={cn("flex h-5 min-h-5", bgClass)}>
+      <div className="w-1 shrink-0" />
+      <div className="w-10 shrink-0 flex items-center justify-end pr-2">
+        <Skeleton className="h-3 w-6" />
+      </div>
+      <div className="w-10 shrink-0 border-r border-border/30 flex items-center justify-end pr-2">
+        <Skeleton className="h-3 w-6" />
+      </div>
+      <div className="flex-1 pl-2 flex items-center">
+        <Skeleton className="h-3" style={{ width: `${width}%` }} />
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,12 @@
+import { rmSync, cpSync, mkdirSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+const root = fileURLToPath(new URL('.', import.meta.url));
+const output = fileURLToPath(new URL('../Dailyglow/PullDashWeb/', import.meta.url));
+rmSync(new URL('upstream/dist/browser/', import.meta.url), { recursive: true, force: true });
+execFileSync('npm', ['run', 'build'], { cwd: root, stdio: 'inherit' });
+rmSync(output, { recursive: true, force: true });
+mkdirSync(output, { recursive: true });
+cpSync(new URL('upstream/dist/browser/', import.meta.url), output, { recursive: true });
+cpSync(new URL('upstream/LICENSE', import.meta.url), output + '/LICENSE');
+console.log('Bundled workspace assets for Dailyglow. Rebuild the Mac app to include them.');

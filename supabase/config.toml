@@ -1,0 +1,10 @@
+[functions.read-notes]
+# Authentication is enforced inside the function via x-read-secret.
+verify_jwt = false
+
+[functions.manage-note]
+verify_jwt = false
+
+[functions.task-sections]
+# The handler verifies the existing x-read-secret for both GET and POST.
+verify_jwt = false
